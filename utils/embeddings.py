@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from openai import OpenAI
 import time
 
@@ -22,11 +23,16 @@ def generate_embeddings(df, api_key, progress_callback=None):
         total = len(df)
         
         for idx, row in df.iterrows():
-            # Combine title and content
+            # Get content
             content = str(row['Content'])[:8000]  # Limit to 8k chars
             
             # Create text for embedding
-            text_for_embedding = f"page content: {content}"
+            # Include title if available
+            if 'Title' in df.columns and pd.notna(row['Title']) and str(row['Title']).strip():
+                title = str(row['Title']).strip()
+                text_for_embedding = f"page title: {title}\n\npage content: {content}"
+            else:
+                text_for_embedding = f"page content: {content}"
             
             try:
                 response = client.embeddings.create(

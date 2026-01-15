@@ -65,6 +65,13 @@ def calculate_similarities(df, threshold=0.85, tfidf_results=None, include_tfidf
                     'TF-IDF Similarity': tfidf_score
                 }
                 
+                # Add titles if available
+                if 'Title' in valid_data.columns:
+                    title1 = valid_data.iloc[i]['Title'] if pd.notna(valid_data.iloc[i]['Title']) else ''
+                    title2 = valid_data.iloc[j]['Title'] if pd.notna(valid_data.iloc[j]['Title']) else ''
+                    result['Title 1'] = title1
+                    result['Title 2'] = title2
+                
                 # Add categories if available
                 if 'Category' in valid_data.columns:
                     cat1 = valid_data.iloc[i]['Category'] if pd.notna(valid_data.iloc[i]['Category']) else 'N/A'

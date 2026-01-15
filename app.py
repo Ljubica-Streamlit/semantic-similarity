@@ -79,7 +79,7 @@ st.header("📤 Upload Your Data")
 uploaded_file = st.file_uploader(
     "Upload CSV file with your content",
     type=['csv'],
-    help="Required columns: URL, Content. Optional: Category"
+    help="Required columns: URL, Content. Optional: Title, Category"
 )
 
 if uploaded_file:
@@ -93,11 +93,12 @@ if uploaded_file:
         
         if missing_columns:
             st.error(f"❌ Missing required columns: {', '.join(missing_columns)}")
-            st.info("Your CSV must have columns named: URL, Content (and optionally: Category)")
+            st.info("Your CSV must have columns named: URL, Content (and optionally: Title, Category)")
             st.stop()
         
-        # Check if Category column exists
+        # Check if optional columns exist
         has_categories = 'Category' in df.columns and not df['Category'].isna().all()
+        has_titles = 'Title' in df.columns
         
         # Remove rows with empty content
         df = df[df['Content'].notna() & (df['Content'].str.strip() != '')]
@@ -118,7 +119,14 @@ if uploaded_file:
         with col1:
             st.metric("Total URLs", len(df))
         with col2:
-            st.metric("Has Categories", "Yes ✅" if has_categories else "No ❌")
+            metrics_text = []
+            if has_titles:
+                metrics_text.append("Title ✅")
+            if has_categories:
+                metrics_text.append("Category ✅")
+            if not metrics_text:
+                metrics_text.append("None")
+            st.metric("Optional Fields", " | ".join(metrics_text))
         with col3:
             avg_content_length = df['Content'].str.len().mean()
             st.metric("Avg Content Length", f"{int(avg_content_length)} chars")
@@ -280,7 +288,10 @@ if uploaded_file:
                         export_df = export_df.drop('Embedding', axis=1)
                         
                         # Reorder columns
-                        cols = ['URL', 'Content']
+                        cols = ['URL']
+                        if has_titles:
+                            cols.append('Title')
+                        cols.extend(['Content'])
                         if has_categories:
                             cols.append('Category')
                         cols.append('AI Embedding')
@@ -307,6 +318,7 @@ if uploaded_file:
                                 '',
                                 'Similarity Threshold Used',
                                 'TF-IDF Analysis Included',
+                                'Titles Provided',
                                 'Categories Provided'
                             ],
                             'Value': [
@@ -322,6 +334,7 @@ if uploaded_file:
                                 '',
                                 f"{similarity_threshold*100}%",
                                 'Yes' if include_tfidf else 'No',
+                                'Yes' if has_titles else 'No',
                                 'Yes' if has_categories else 'No'
                             ]
                         }
@@ -378,13 +391,14 @@ else:
     Your CSV file must contain:
     - **URL** (required): The page URL
     - **Content** (required): The full text content of the page
+    - **Title** (optional): The page title (can be empty)
     - **Category** (optional): Page category for grouping
     
     Example:
 ```
-    URL,Content,Category
-    https://example.com/page1,"Full page content here...",Blog
-    https://example.com/page2,"More content here...",Product
+    URL,Title,Content,Category
+    https://example.com/page1,"Page Title 1","Full page content here...",Blog
+    https://example.com/page2,"","More content here...",Product
 ```
     """)
     

@@ -50,13 +50,26 @@ with st.sidebar:
     )
     
     similarity_threshold = st.slider(
-        "Minimum Similarity Threshold (%)",
+        "AI Similarity Threshold (%)",
         min_value=75,
         max_value=95,
         value=85,
         step=5,
-        help="Only show pairs with similarity above this threshold"
+        help="Only show pairs with AI similarity above this threshold"
     ) / 100
+    
+    # Add separate TF-IDF threshold if TF-IDF is enabled
+    if include_tfidf:
+        tfidf_threshold = st.slider(
+            "TF-IDF Similarity Threshold (%)",
+            min_value=30,
+            max_value=80,
+            value=50,
+            step=5,
+            help="TF-IDF similarities are typically lower than AI similarities. 50% is a good starting point."
+        ) / 100
+    else:
+        tfidf_threshold = 0.5  # Default value when not shown
     
     st.markdown("---")
     
@@ -192,13 +205,13 @@ if uploaded_file:
                         
                         tfidf_results = calculate_tfidf_similarity(
                             df,
-                            threshold=similarity_threshold,
+                            threshold=tfidf_threshold,
                             progress_callback=lambda current, total: (
                                 progress_bar.progress(current / total),
                                 status_text.text(f"Comparing {current}/{total} pairs...")
                             )
                         )
-                        st.success(f"✅ TF-IDF analysis complete")
+                        st.success(f"✅ TF-IDF analysis complete: {len(tfidf_results)} pairs found above {tfidf_threshold*100}% threshold")
                 else:
                     st.info("⏭️ Step 2/3: TF-IDF analysis skipped")
                 
@@ -304,39 +317,53 @@ if uploaded_file:
                         results_export.to_excel(writer, sheet_name='Similarity Analysis', index=False)
                         
                         # Sheet 3: Summary Statistics
+                        summary_metrics = [
+                            'Total URLs Analyzed',
+                            'Total Similar Pairs Found',
+                            'High Priority Pairs (≥95%)',
+                            'Medium Priority Pairs (90-95%)',
+                            'Low Priority Pairs (85-90%)',
+                            '',
+                            'Average AI Similarity',
+                            'Maximum AI Similarity',
+                            'Minimum AI Similarity',
+                            '',
+                            'AI Similarity Threshold Used',
+                        ]
+                        
+                        summary_values = [
+                            len(df),
+                            len(results_df),
+                            high_priority,
+                            medium_priority,
+                            low_priority,
+                            '',
+                            f"{results_df['AI Similarity'].mean()*100:.2f}%",
+                            f"{results_df['AI Similarity'].max()*100:.2f}%",
+                            f"{results_df['AI Similarity'].min()*100:.2f}%",
+                            '',
+                            f"{similarity_threshold*100}%",
+                        ]
+                        
+                        if include_tfidf:
+                            summary_metrics.append('TF-IDF Threshold Used')
+                            summary_values.append(f"{tfidf_threshold*100}%")
+                        
+                        summary_metrics.extend([
+                            'TF-IDF Analysis Included',
+                            'Titles Provided',
+                            'Categories Provided'
+                        ])
+                        
+                        summary_values.extend([
+                            'Yes' if include_tfidf else 'No',
+                            'Yes' if has_titles else 'No',
+                            'Yes' if has_categories else 'No'
+                        ])
+                        
                         summary_data = {
-                            'Metric': [
-                                'Total URLs Analyzed',
-                                'Total Similar Pairs Found',
-                                'High Priority Pairs (≥95%)',
-                                'Medium Priority Pairs (90-95%)',
-                                'Low Priority Pairs (85-90%)',
-                                '',
-                                'Average AI Similarity',
-                                'Maximum AI Similarity',
-                                'Minimum AI Similarity',
-                                '',
-                                'Similarity Threshold Used',
-                                'TF-IDF Analysis Included',
-                                'Titles Provided',
-                                'Categories Provided'
-                            ],
-                            'Value': [
-                                len(df),
-                                len(results_df),
-                                high_priority,
-                                medium_priority,
-                                low_priority,
-                                '',
-                                f"{results_df['AI Similarity'].mean()*100:.2f}%",
-                                f"{results_df['AI Similarity'].max()*100:.2f}%",
-                                f"{results_df['AI Similarity'].min()*100:.2f}%",
-                                '',
-                                f"{similarity_threshold*100}%",
-                                'Yes' if include_tfidf else 'No',
-                                'Yes' if has_titles else 'No',
-                                'Yes' if has_categories else 'No'
-                            ]
+                            'Metric': summary_metrics,
+                            'Value': summary_values
                         }
                         summary_df = pd.DataFrame(summary_data)
                         summary_df.to_excel(writer, sheet_name='Summary', index=False)

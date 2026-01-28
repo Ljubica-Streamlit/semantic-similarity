@@ -49,14 +49,37 @@ with st.sidebar:
         help="Calculate keyword overlap in addition to semantic similarity. This is faster and free but less accurate."
     )
     
+    # Show TF-IDF independently option only when TF-IDF is enabled
+    if include_tfidf:
+        tfidf_independent = st.checkbox(
+            "Show TF-IDF Results Independently",
+            value=False,
+            help="Show all TF-IDF matches regardless of AI similarity score. This helps find keyword cannibalization that AI might miss."
+        )
+    else:
+        tfidf_independent = False
+    
     similarity_threshold = st.slider(
-        "Minimum Similarity Threshold (%)",
+        "AI Similarity Threshold (%)",
         min_value=75,
         max_value=95,
         value=85,
         step=5,
-        help="Only show pairs with similarity above this threshold"
+        help="Only show pairs with AI similarity above this threshold"
     ) / 100
+    
+    # Add TF-IDF threshold slider if independent mode is enabled
+    if include_tfidf and tfidf_independent:
+        tfidf_threshold = st.slider(
+            "TF-IDF Similarity Threshold (%)",
+            min_value=30,
+            max_value=95,
+            value=85,
+            step=5,
+            help="Minimum TF-IDF similarity to show in independent results"
+        ) / 100
+    else:
+        tfidf_threshold = similarity_threshold  # Use same threshold as AI
     
     st.markdown("---")
     
@@ -79,7 +102,7 @@ st.header("📤 Upload Your Data")
 uploaded_file = st.file_uploader(
     "Upload CSV file with your content",
     type=['csv'],
-    help="Required columns: URL, Content. Optional: Category"
+    help="Required: URL, Content. Optional: Embedding (JSON array), Category"
 )
 
 if uploaded_file:
@@ -93,8 +116,34 @@ if uploaded_file:
         
         if missing_columns:
             st.error(f"❌ Missing required columns: {', '.join(missing_columns)}")
-            st.info("Your CSV must have columns named: URL, Content (and optionally: Category)")
+            st.info("Your CSV must have columns named: URL, Content (and optionally: Embedding, Category)")
             st.stop()
+        
+        # Check if embeddings already exist in the file
+        has_embeddings = 'Embedding' in df.columns or 'AI Embedding' in df.columns
+        
+        if has_embeddings:
+            # Determine which column name is used
+            embedding_col = 'Embedding' if 'Embedding' in df.columns else 'AI Embedding'
+            
+            # Parse embeddings from JSON strings to numpy arrays
+            try:
+                df['Embedding'] = df[embedding_col].apply(
+                    lambda x: np.array(json.loads(x)) if pd.notna(x) and isinstance(x, str) else x
+                )
+                # Count valid embeddings
+                valid_embeddings = df['Embedding'].apply(
+                    lambda x: isinstance(x, np.ndarray) and len(x) > 0
+                ).sum()
+                
+                if valid_embeddings > 0:
+                    st.info(f"✅ Found {valid_embeddings} existing embeddings in file - will skip embedding generation!")
+                else:
+                    has_embeddings = False
+                    st.warning("⚠️ Embedding column found but no valid embeddings detected")
+            except Exception as e:
+                has_embeddings = False
+                st.warning(f"⚠️ Could not parse embeddings: {str(e)}")
         
         # Check if Category column exists
         has_categories = 'Category' in df.columns and not df['Category'].isna().all()
@@ -118,24 +167,30 @@ if uploaded_file:
         with col1:
             st.metric("Total URLs", len(df))
         with col2:
-            st.metric("Has Categories", "Yes ✅" if has_categories else "No ❌")
+            st.metric("Has Embeddings", "Yes ✅" if has_embeddings else "No ❌")
         with col3:
-            avg_content_length = df['Content'].str.len().mean()
-            st.metric("Avg Content Length", f"{int(avg_content_length)} chars")
+            st.metric("Has Categories", "Yes ✅" if has_categories else "No ❌")
         
         # Show preview
         with st.expander("📋 Preview Data (first 5 rows)"):
             st.dataframe(df.head())
         
         # Cost estimation
-        if api_key:
+        if api_key or has_embeddings:
             st.header("💰 Cost Estimation")
             
-            estimated_cost = estimate_cost(df)
+            if has_embeddings:
+                st.success("✅ Using existing embeddings - No API cost for embedding generation!")
+                estimated_cost = 0
+            else:
+                estimated_cost = estimate_cost(df)
             
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("Estimated OpenAI Cost", f"${estimated_cost:.4f}")
+                if has_embeddings:
+                    st.metric("Estimated OpenAI Cost", "$0.00 (Using existing embeddings)")
+                else:
+                    st.metric("Estimated OpenAI Cost", f"${estimated_cost:.4f}")
             with col2:
                 total_comparisons = (len(df) * (len(df) - 1)) // 2
                 st.metric("Total Comparisons", f"{total_comparisons:,}")
@@ -147,33 +202,36 @@ if uploaded_file:
             
             # Analysis button
             if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
-                if not api_key:
-                    st.error("❌ Please provide your OpenAI API key in the sidebar")
+                if not api_key and not has_embeddings:
+                    st.error("❌ Please provide your OpenAI API key in the sidebar or upload a file with existing embeddings")
                     st.stop()
                 
                 # Start analysis
                 st.header("⚙️ Processing...")
                 
-                # Step 1: Generate embeddings
-                with st.spinner("Step 1/3: Generating AI embeddings..."):
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    embeddings_result = generate_embeddings(
-                        df, 
-                        api_key,
-                        progress_callback=lambda current, total: (
-                            progress_bar.progress(current / total),
-                            status_text.text(f"Processing {current}/{total} pages...")
+                # Step 1: Generate embeddings (only if needed)
+                if not has_embeddings:
+                    with st.spinner("Step 1/3: Generating AI embeddings..."):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        embeddings_result = generate_embeddings(
+                            df, 
+                            api_key,
+                            progress_callback=lambda current, total: (
+                                progress_bar.progress(current / total),
+                                status_text.text(f"Processing {current}/{total} pages...")
+                            )
                         )
-                    )
-                    
-                    if embeddings_result['success']:
-                        df['Embedding'] = embeddings_result['embeddings']
-                        st.success(f"✅ Generated {len(embeddings_result['embeddings'])} embeddings")
-                    else:
-                        st.error(f"❌ Error: {embeddings_result['error']}")
-                        st.stop()
+                        
+                        if embeddings_result['success']:
+                            df['Embedding'] = embeddings_result['embeddings']
+                            st.success(f"✅ Generated {len(embeddings_result['embeddings'])} embeddings")
+                        else:
+                            st.error(f"❌ Error: {embeddings_result['error']}")
+                            st.stop()
+                else:
+                    st.info("⏭️ Step 1/3: Using existing embeddings - skipped generation")
                 
                 # Step 2: TF-IDF (optional)
                 tfidf_results = None
@@ -184,13 +242,13 @@ if uploaded_file:
                         
                         tfidf_results = calculate_tfidf_similarity(
                             df,
-                            threshold=similarity_threshold,
+                            threshold=tfidf_threshold,
                             progress_callback=lambda current, total: (
                                 progress_bar.progress(current / total),
                                 status_text.text(f"Comparing {current}/{total} pairs...")
                             )
                         )
-                        st.success(f"✅ TF-IDF analysis complete")
+                        st.success(f"✅ TF-IDF analysis complete: Found {len(tfidf_results) if tfidf_results else 0} pairs above {tfidf_threshold*100}% threshold")
                 else:
                     st.info("⏭️ Step 2/3: TF-IDF analysis skipped")
                 
@@ -204,6 +262,7 @@ if uploaded_file:
                         threshold=similarity_threshold,
                         tfidf_results=tfidf_results,
                         include_tfidf=include_tfidf,
+                        tfidf_independent=tfidf_independent,
                         progress_callback=lambda current, total: (
                             progress_bar.progress(current / total),
                             status_text.text(f"Comparing {current}/{total} pairs...")
@@ -247,6 +306,12 @@ if uploaded_file:
                 
                 # Top 10 results preview
                 st.subheader("🔝 Top 10 Similar Pairs")
+                
+                # Show TF-IDF statistics if available
+                if include_tfidf and 'TF-IDF Similarity' in results_df.columns:
+                    tfidf_numeric = results_df[results_df['TF-IDF Similarity'] != "Not checked"]['TF-IDF Similarity']
+                    if len(tfidf_numeric) > 0:
+                        st.info(f"📊 TF-IDF Stats: {len(tfidf_numeric)} pairs have TF-IDF scores (avg: {tfidf_numeric.mean()*100:.1f}%)")
                 
                 # Format for display
                 display_df = results_df.head(10).copy()
@@ -378,14 +443,29 @@ else:
     Your CSV file must contain:
     - **URL** (required): The page URL
     - **Content** (required): The full text content of the page
+    - **Embedding** (optional): Pre-computed AI embedding as JSON array - saves API costs!
     - **Category** (optional): Page category for grouping
     
-    Example:
-```
+    **Example - Basic:**
+```csv
     URL,Content,Category
     https://example.com/page1,"Full page content here...",Blog
     https://example.com/page2,"More content here...",Product
 ```
+    
+    **Example - With Embeddings (no API key needed!):**
+```csv
+    URL,Content,Embedding,Category
+    https://example.com/page1,"Content...","[0.123, -0.456, ...]",Blog
+    https://example.com/page2,"Content...","[0.789, -0.012, ...]",Product
+```
+    """)
+    
+    st.markdown("### ✨ New Features")
+    st.markdown("""
+    - **Reuse Embeddings**: Upload files with existing embeddings to skip API costs
+    - **Independent TF-IDF**: Find keyword cannibalization even when semantic similarity is low
+    - **Flexible Analysis**: Mix and match AI and TF-IDF results for comprehensive insights
     """)
     
     st.markdown("### 🔑 API Key")
@@ -393,6 +473,8 @@ else:
     You'll need an OpenAI API key to use this tool. Get one at [platform.openai.com](https://platform.openai.com/api-keys).
     
     **Cost:** Approximately $0.02 per 1,000 pages analyzed.
+    
+    **Tip:** Download the embeddings from your first analysis to reuse them later without additional API costs!
     """)
 
 # Footer

@@ -18,8 +18,8 @@ def categorize_priority(similarity_score):
     else:
         return 'Below Threshold'
 
-def calculate_similarities(df, threshold=0.85, tfidf_results=None, include_tfidf=False, tfidf_independent=False, progress_callback=None):
-    """Calculate pairwise similarities between all pages"""
+def calculate_similarities(df, threshold=0.85, progress_callback=None):
+    """Calculate pairwise semantic similarities between all pages"""
     results = []
     
     # Get valid embeddings
@@ -28,55 +28,27 @@ def calculate_similarities(df, threshold=0.85, tfidf_results=None, include_tfidf
     total_comparisons = (len(valid_data) * (len(valid_data) - 1)) // 2
     current_comparison = 0
     
-    # Create TF-IDF lookup if provided
-    tfidf_lookup = {}
-    if tfidf_results:
-        for result in tfidf_results:
-            key = tuple(sorted([result['URL 1'], result['URL 2']]))
-            tfidf_lookup[key] = result['TF-IDF Similarity']
-    
     for i in range(len(valid_data)):
         for j in range(i + 1, len(valid_data)):
             emb_i = valid_data.iloc[i]['Embedding']
             emb_j = valid_data.iloc[j]['Embedding']
             
-            # Calculate AI similarity
-            ai_similarity = calculate_cosine_similarity(emb_i, emb_j)
+            # Calculate semantic similarity
+            semantic_similarity = calculate_cosine_similarity(emb_i, emb_j)
             
             current_comparison += 1
             if progress_callback and current_comparison % 100 == 0:
                 progress_callback(current_comparison, total_comparisons)
             
-            url1 = valid_data.iloc[i]['URL']
-            url2 = valid_data.iloc[j]['URL']
-            
-            # Get TF-IDF score if available
-            tfidf_score = "Not checked"
-            if include_tfidf and tfidf_lookup:
-                key = tuple(sorted([url1, url2]))
-                tfidf_score = tfidf_lookup.get(key, "Not checked")
-            
-            # Decide whether to include this pair
-            include_pair = False
-            
-            if tfidf_independent:
-                # Independent mode: include if EITHER AI or TF-IDF is above threshold
-                if ai_similarity >= threshold:
-                    include_pair = True
-                elif tfidf_score != "Not checked" and tfidf_score != 0.0:
-                    # TF-IDF found a match (already filtered by its own threshold)
-                    include_pair = True
-            else:
-                # Normal mode: only include if AI similarity is above threshold
-                if ai_similarity >= threshold:
-                    include_pair = True
-            
-            if include_pair:
+            # Only include if above threshold
+            if semantic_similarity >= threshold:
+                url1 = valid_data.iloc[i]['URL']
+                url2 = valid_data.iloc[j]['URL']
+                
                 result = {
                     'URL 1': url1,
                     'URL 2': url2,
-                    'AI Similarity': ai_similarity,
-                    'TF-IDF Similarity': tfidf_score
+                    'Semantic Similarity': semantic_similarity
                 }
                 
                 # Add categories if available

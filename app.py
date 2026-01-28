@@ -46,37 +46,37 @@ with st.sidebar:
     include_tfidf = st.checkbox(
         "Include TF-IDF Analysis",
         value=False,
-        help="Calculate keyword overlap in addition to semantic similarity. This is faster and free but less accurate."
+        help="Calculate keyword overlap for semantic similarity results."
     )
     
     # Show TF-IDF independently option only when TF-IDF is enabled
     if include_tfidf:
-        tfidf_independent = st.checkbox(
-            "Show TF-IDF Results Independently",
+        show_tfidf_only_matches = st.checkbox(
+            "Show Additional TF-IDF Matches",
             value=False,
-            help="Show all TF-IDF matches regardless of AI similarity score. This helps find keyword cannibalization that AI might miss."
+            help="Also show pairs with high keyword overlap (TF-IDF) but low semantic similarity. Helps find pages using similar words but different meanings."
         )
     else:
-        tfidf_independent = False
+        show_tfidf_only_matches = False
     
     similarity_threshold = st.slider(
-        "AI Similarity Threshold (%)",
+        "Semantic Similarity Threshold (%)",
         min_value=75,
         max_value=95,
         value=85,
         step=5,
-        help="Only show pairs with AI similarity above this threshold"
+        help="Only show pairs with semantic similarity above this threshold"
     ) / 100
     
     # Add TF-IDF threshold slider if independent mode is enabled
-    if include_tfidf and tfidf_independent:
+    if include_tfidf and show_tfidf_only_matches:
         tfidf_threshold = st.slider(
             "TF-IDF Similarity Threshold (%)",
             min_value=30,
             max_value=95,
             value=85,
             step=5,
-            help="Minimum TF-IDF similarity to show in independent results"
+            help="Minimum TF-IDF similarity for additional matches"
         ) / 100
     else:
         tfidf_threshold = similarity_threshold  # Use same threshold as AI
@@ -233,43 +233,98 @@ if uploaded_file:
                 else:
                     st.info("⏭️ Step 1/3: Using existing embeddings - skipped generation")
                 
-                # Step 2: TF-IDF (optional)
-                tfidf_results = None
-                if include_tfidf:
-                    with st.spinner("Step 2/3: Calculating TF-IDF similarity..."):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        tfidf_results = calculate_tfidf_similarity(
-                            df,
-                            threshold=tfidf_threshold,
-                            progress_callback=lambda current, total: (
-                                progress_bar.progress(current / total),
-                                status_text.text(f"Comparing {current}/{total} pairs...")
-                            )
-                        )
-                        st.success(f"✅ TF-IDF analysis complete: Found {len(tfidf_results) if tfidf_results else 0} pairs above {tfidf_threshold*100}% threshold")
-                else:
-                    st.info("⏭️ Step 2/3: TF-IDF analysis skipped")
-                
-                # Step 3: Calculate similarities
-                with st.spinner("Step 3/3: Calculating semantic similarities..."):
+                # Step 2: Calculate semantic similarities
+                with st.spinner("Step 2/3: Calculating semantic similarities..."):
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
                     results = calculate_similarities(
                         df,
                         threshold=similarity_threshold,
-                        tfidf_results=tfidf_results,
-                        include_tfidf=include_tfidf,
-                        tfidf_independent=tfidf_independent,
                         progress_callback=lambda current, total: (
                             progress_bar.progress(current / total),
                             status_text.text(f"Comparing {current}/{total} pairs...")
                         )
                     )
                     
-                    st.success(f"✅ Found {len(results)} similar pairs above {similarity_threshold*100}% threshold")
+                    st.success(f"✅ Found {len(results)} pairs above {similarity_threshold*100}% semantic similarity threshold")
+                
+                # Step 3: TF-IDF analysis
+                if include_tfidf:
+                    with st.spinner("Step 3/3: Calculating TF-IDF for results..."):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        # Create list of URL pairs from semantic similarity results
+                        semantic_pairs = [(r['URL 1'], r['URL 2']) for r in results]
+                        
+                        # Calculate TF-IDF only for semantic similarity pairs
+                        from utils.tfidf import calculate_tfidf_for_pairs
+                        tfidf_scores = calculate_tfidf_for_pairs(
+                            df,
+                            semantic_pairs,
+                            progress_callback=lambda current, total: (
+                                progress_bar.progress(current / total),
+                                status_text.text(f"Calculating TF-IDF for {current}/{total} pairs...")
+                            )
+                        )
+                        
+                        # Add TF-IDF scores to results
+                        for result in results:
+                            key = tuple(sorted([result['URL 1'], result['URL 2']]))
+                            result['TF-IDF Similarity'] = tfidf_scores.get(key, 0.0)
+                        
+                        # If show_tfidf_only_matches is enabled, find additional pairs
+                        additional_pairs = []
+                        if show_tfidf_only_matches:
+                            status_text.text("Finding additional TF-IDF matches...")
+                            
+                            # Calculate TF-IDF for all pairs
+                            all_tfidf_results = calculate_tfidf_similarity(
+                                df,
+                                threshold=tfidf_threshold,
+                                progress_callback=None
+                            )
+                            
+                            # Filter to only pairs NOT already in semantic results
+                            existing_pairs = {tuple(sorted([r['URL 1'], r['URL 2']])) for r in results}
+                            
+                            for tfidf_result in all_tfidf_results:
+                                pair_key = tuple(sorted([tfidf_result['URL 1'], tfidf_result['URL 2']]))
+                                if pair_key not in existing_pairs:
+                                    # This is a TF-IDF match that wasn't in semantic results
+                                    # Get the semantic similarity for this pair
+                                    url1, url2 = tfidf_result['URL 1'], tfidf_result['URL 2']
+                                    
+                                    # Find these URLs in the dataframe
+                                    idx1 = df[df['URL'] == url1].index[0]
+                                    idx2 = df[df['URL'] == url2].index[0]
+                                    
+                                    # Calculate semantic similarity for this pair
+                                    from utils.similarity import calculate_cosine_similarity
+                                    emb1 = df.loc[idx1, 'Embedding']
+                                    emb2 = df.loc[idx2, 'Embedding']
+                                    semantic_sim = calculate_cosine_similarity(emb1, emb2)
+                                    
+                                    additional_pairs.append({
+                                        'URL 1': url1,
+                                        'URL 2': url2,
+                                        'Semantic Similarity': semantic_sim,
+                                        'TF-IDF Similarity': tfidf_result['TF-IDF Similarity']
+                                    })
+                            
+                            if additional_pairs:
+                                st.info(f"✅ Found {len(additional_pairs)} additional pairs with high TF-IDF but low semantic similarity")
+                        
+                        st.success(f"✅ TF-IDF analysis complete")
+                else:
+                    st.info("⏭️ Step 3/3: TF-IDF analysis skipped")
+                
+                # Combine results
+                if include_tfidf and show_tfidf_only_matches and additional_pairs:
+                    # Add additional pairs to results
+                    results.extend(additional_pairs)
+                    st.info(f"📊 Total results: {len(results)} pairs ({len(results) - len(additional_pairs)} semantic + {len(additional_pairs)} TF-IDF only)")
                 
                 if len(results) == 0:
                     st.warning(f"⚠️ No similar pairs found above {similarity_threshold*100}% threshold. Try lowering the threshold.")
@@ -278,8 +333,8 @@ if uploaded_file:
                 # Create results dataframe
                 results_df = pd.DataFrame(results)
                 
-                # Add priority categorization
-                results_df['Priority'] = results_df['AI Similarity'].apply(categorize_priority)
+                # Add priority categorization based on semantic similarity
+                results_df['Priority'] = results_df['Semantic Similarity'].apply(categorize_priority)
                 
                 # Display results
                 st.header("📊 Analysis Results")
@@ -296,8 +351,8 @@ if uploaded_file:
                     low_priority = len(results_df[results_df['Priority'] == '🟢 Low Priority'])
                     st.metric("Low Priority", low_priority)
                 with col4:
-                    avg_similarity = results_df['AI Similarity'].mean()
-                    st.metric("Avg Similarity", f"{avg_similarity*100:.1f}%")
+                    avg_similarity = results_df['Semantic Similarity'].mean()
+                    st.metric("Avg Semantic Similarity", f"{avg_similarity*100:.1f}%")
                 
                 # Priority distribution chart
                 st.subheader("📈 Priority Distribution")
@@ -309,16 +364,16 @@ if uploaded_file:
                 
                 # Show TF-IDF statistics if available
                 if include_tfidf and 'TF-IDF Similarity' in results_df.columns:
-                    tfidf_numeric = results_df[results_df['TF-IDF Similarity'] != "Not checked"]['TF-IDF Similarity']
+                    tfidf_numeric = results_df['TF-IDF Similarity']
                     if len(tfidf_numeric) > 0:
-                        st.info(f"📊 TF-IDF Stats: {len(tfidf_numeric)} pairs have TF-IDF scores (avg: {tfidf_numeric.mean()*100:.1f}%)")
+                        st.info(f"📊 TF-IDF Stats: All {len(tfidf_numeric)} pairs analyzed (avg: {tfidf_numeric.mean()*100:.1f}%)")
                 
                 # Format for display
                 display_df = results_df.head(10).copy()
-                display_df['AI Similarity'] = display_df['AI Similarity'].apply(lambda x: f"{x*100:.2f}%")
-                if include_tfidf:
+                display_df['Semantic Similarity'] = display_df['Semantic Similarity'].apply(lambda x: f"{x*100:.2f}%")
+                if include_tfidf and 'TF-IDF Similarity' in display_df.columns:
                     display_df['TF-IDF Similarity'] = display_df['TF-IDF Similarity'].apply(
-                        lambda x: f"{x*100:.2f}%" if x != "Not checked" else x
+                        lambda x: f"{x*100:.2f}%"
                     )
                 
                 st.dataframe(
@@ -366,12 +421,13 @@ if uploaded_file:
                                 'Medium Priority Pairs (90-95%)',
                                 'Low Priority Pairs (85-90%)',
                                 '',
-                                'Average AI Similarity',
-                                'Maximum AI Similarity',
-                                'Minimum AI Similarity',
+                                'Average Semantic Similarity',
+                                'Maximum Semantic Similarity',
+                                'Minimum Semantic Similarity',
                                 '',
-                                'Similarity Threshold Used',
+                                'Semantic Similarity Threshold Used',
                                 'TF-IDF Analysis Included',
+                                'Embeddings Pre-existing',
                                 'Categories Provided'
                             ],
                             'Value': [
@@ -381,12 +437,13 @@ if uploaded_file:
                                 medium_priority,
                                 low_priority,
                                 '',
-                                f"{results_df['AI Similarity'].mean()*100:.2f}%",
-                                f"{results_df['AI Similarity'].max()*100:.2f}%",
-                                f"{results_df['AI Similarity'].min()*100:.2f}%",
+                                f"{results_df['Semantic Similarity'].mean()*100:.2f}%",
+                                f"{results_df['Semantic Similarity'].max()*100:.2f}%",
+                                f"{results_df['Semantic Similarity'].min()*100:.2f}%",
                                 '',
                                 f"{similarity_threshold*100}%",
                                 'Yes' if include_tfidf else 'No',
+                                'Yes' if has_embeddings else 'No',
                                 'Yes' if has_categories else 'No'
                             ]
                         }

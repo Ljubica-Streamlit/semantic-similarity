@@ -18,7 +18,7 @@ def categorize_priority(similarity_score):
     else:
         return 'Below Threshold'
 
-def calculate_similarities(df, threshold=0.85, tfidf_results=None, include_tfidf=False, progress_callback=None):
+def calculate_similarities(df, threshold=0.85, tfidf_results=None, include_tfidf=False, tfidf_independent=False, progress_callback=None):
     """Calculate pairwise similarities between all pages"""
     results = []
     
@@ -47,17 +47,31 @@ def calculate_similarities(df, threshold=0.85, tfidf_results=None, include_tfidf
             if progress_callback and current_comparison % 100 == 0:
                 progress_callback(current_comparison, total_comparisons)
             
-            # Only include if above threshold
-            if ai_similarity >= threshold:
-                url1 = valid_data.iloc[i]['URL']
-                url2 = valid_data.iloc[j]['URL']
-                
-                # Get TF-IDF score if available
-                tfidf_score = "Not checked"
-                if include_tfidf and tfidf_lookup:
-                    key = tuple(sorted([url1, url2]))
-                    tfidf_score = tfidf_lookup.get(key, 0.0)
-                
+            url1 = valid_data.iloc[i]['URL']
+            url2 = valid_data.iloc[j]['URL']
+            
+            # Get TF-IDF score if available
+            tfidf_score = "Not checked"
+            if include_tfidf and tfidf_lookup:
+                key = tuple(sorted([url1, url2]))
+                tfidf_score = tfidf_lookup.get(key, "Not checked")
+            
+            # Decide whether to include this pair
+            include_pair = False
+            
+            if tfidf_independent:
+                # Independent mode: include if EITHER AI or TF-IDF is above threshold
+                if ai_similarity >= threshold:
+                    include_pair = True
+                elif tfidf_score != "Not checked" and tfidf_score != 0.0:
+                    # TF-IDF found a match (already filtered by its own threshold)
+                    include_pair = True
+            else:
+                # Normal mode: only include if AI similarity is above threshold
+                if ai_similarity >= threshold:
+                    include_pair = True
+            
+            if include_pair:
                 result = {
                     'URL 1': url1,
                     'URL 2': url2,

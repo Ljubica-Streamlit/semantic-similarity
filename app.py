@@ -218,17 +218,51 @@ if uploaded_file:
                         embeddings_result = generate_embeddings(
                             df, 
                             api_key,
-                            progress_callback=lambda current, total: (
-                                progress_bar.progress(current / total),
+                            progress_callback=lambda current, total, progress_value: (
+                                progress_bar.progress(progress_value),
                                 status_text.text(f"Processing {current}/{total} pages...")
                             )
                         )
                         
                         if embeddings_result['success']:
+                            # Report skipped rows if any
+                            skipped = embeddings_result.get('skipped_rows', [])
+                            if skipped:
+                                st.warning(f"⚠️ {len(skipped)} pages were skipped due to errors after retries.")
+                                with st.expander(f"View {len(skipped)} skipped pages"):
+                                    for s in skipped:
+                                        st.text(f"Row {s['row']}: {s['url']}")
+                            
                             df['Embedding'] = embeddings_result['embeddings']
-                            st.success(f"✅ Generated {len(embeddings_result['embeddings'])} embeddings")
+                            valid_count = sum(1 for e in embeddings_result['embeddings'] if e is not None)
+                            st.success(f"✅ Generated {valid_count}/{len(df)} embeddings")
                         else:
                             st.error(f"❌ Error: {embeddings_result['error']}")
+                            
+                            # Offer download of partial embeddings if any were generated
+                            partial = embeddings_result.get('partial_embeddings', [])
+                            if partial:
+                                st.warning(f"💾 {len(partial)} embeddings were generated before the error. Download them to avoid paying again.")
+                                
+                                # Build partial embeddings JSON keyed by URL
+                                partial_dict = {}
+                                for i, emb in enumerate(partial):
+                                    if i < len(df) and isinstance(emb, np.ndarray):
+                                        url = df.iloc[i]['URL']
+                                        partial_dict[url] = emb.tolist()
+                                
+                                if partial_dict:
+                                    partial_json = json.dumps(partial_dict, indent=2)
+                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                    st.download_button(
+                                        label=f"📥 Download {len(partial_dict)} Partial Embeddings (JSON)",
+                                        data=partial_json,
+                                        file_name=f"partial_embeddings_{timestamp}.json",
+                                        mime="application/json",
+                                        use_container_width=True
+                                    )
+                                    st.info("💡 **Tip:** To resume later, add an 'Embedding' column to your CSV with these values, or upload this JSON alongside your data.")
+                            
                             st.stop()
                 else:
                     st.info("⏭️ Step 1/3: Using existing embeddings - skipped generation")
@@ -242,7 +276,7 @@ if uploaded_file:
                         df,
                         threshold=similarity_threshold,
                         progress_callback=lambda current, total: (
-                            progress_bar.progress(current / total),
+                            progress_bar.progress(min(current / total, 1.0)),
                             status_text.text(f"Comparing {current}/{total} pairs...")
                         )
                     )
@@ -264,7 +298,7 @@ if uploaded_file:
                             df,
                             semantic_pairs,
                             progress_callback=lambda current, total: (
-                                progress_bar.progress(current / total),
+                                progress_bar.progress(min(current / total, 1.0)),
                                 status_text.text(f"Calculating TF-IDF for {current}/{total} pairs...")
                             )
                         )

@@ -15,6 +15,7 @@ from utils.similarity import (
 )
 from utils.tfidf import calculate_tfidf_for_pairs, calculate_tfidf_similarity
 from utils.export import embeddings_csv, results_csv, summary_csv
+from utils.columns import load_table, detect_columns, column_labels, build_dataframe
 
 st.set_page_config(page_title="Semantic Similarity Analyzer", page_icon="🔍", layout="wide")
 
@@ -26,17 +27,6 @@ Find duplicate, near-duplicate and overlapping content across your site.
 
 
 # ---------------------------------------------------------------- helpers
-def read_csv_any_encoding(uploaded):
-    raw = uploaded.getvalue()
-    last_err = None
-    for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
-        try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc)
-        except UnicodeDecodeError as e:
-            last_err = e
-    raise last_err
-
-
 def parse_embedding(x):
     """Return np.ndarray or None. Never raises."""
     if isinstance(x, np.ndarray):
@@ -99,28 +89,21 @@ with st.sidebar:
 # ---------------------------------------------------------------- upload
 st.header("📤 Upload Your Data")
 uploaded_file = st.file_uploader(
-    "Upload CSV file with your content", type=['csv'],
-    help="Required: URL, Content. Optional: Embedding (JSON array), Category")
+    "Upload a CSV or Excel file with your page URLs and their content",
+    type=['csv', 'xlsx', 'tsv', 'txt'],
+    help="Any column order, with or without headers. Columns are detected automatically.")
 
 if not uploaded_file:
     st.session_state.pop('run', None)
-    st.info("👆 Upload your CSV file to begin analysis")
-    st.markdown("### 📝 CSV Format Requirements")
+    st.info("👆 Upload a CSV or Excel file with page URLs and their content – any column order, "
+            "with or without headers.")
     st.markdown("""
-Your CSV file must contain:
-- **URL** (required): The page URL
-- **Content** (required): The full text content of the page
-- **Embedding** (optional): Pre-computed embedding as JSON array – saves API costs!
-- **Category** (optional): Page category for grouping
+**That's it.** The app finds the URL and content columns by itself. Optional extras are picked up
+automatically too: a **Category** column, and an **Embedding** column from a previous run
+(re-upload your *Data + Embeddings CSV* to skip API costs – only missing rows are generated).
 
-**Tip:** The *Data + Embeddings CSV* you download after an analysis can be uploaded again as-is –
-no new API cost. If some rows are missing embeddings, only those rows are generated.
-""")
-    st.markdown("### 🔑 API Key")
-    st.markdown("""
-You'll need an OpenAI API key. Get one at [platform.openai.com](https://platform.openai.com/api-keys).
-
-**Cost:** approximately $0.02 per 1,000 pages.
+You'll need an OpenAI API key ([get one here](https://platform.openai.com/api-keys)) –
+about **$0.02 per 1,000 pages**.
 """)
     st.markdown("---")
     st.markdown("<div style='text-align:center;color:#666'>Built with Streamlit • Powered by OpenAI • "
@@ -128,50 +111,96 @@ You'll need an OpenAI API key. Get one at [platform.openai.com](https://platform
     st.stop()
 
 # Reset stored results when a different file is uploaded
-file_id = hashlib.md5(uploaded_file.getvalue()).hexdigest()
+raw_bytes = uploaded_file.getvalue()
+file_id = hashlib.md5(raw_bytes).hexdigest()
 if st.session_state.get('file_id') != file_id:
     st.session_state['file_id'] = file_id
     st.session_state.pop('run', None)
 
 try:
-    df = read_csv_any_encoding(uploaded_file)
+    raw = load_table(uploaded_file.name, raw_bytes)
 except Exception as e:
-    st.error(f"❌ Could not read the CSV file: {e}")
-    st.info("Please make sure the file is a valid CSV with 'URL' and 'Content' columns.")
+    st.error(f"❌ Could not open this file: {e}")
+    st.info("Please upload a CSV or Excel (.xlsx) file.")
     st.stop()
 
-df.columns = [str(c).strip() for c in df.columns]
-missing_columns = [c for c in ('URL', 'Content') if c not in df.columns]
-if missing_columns:
-    st.error(f"❌ Missing required columns: {', '.join(missing_columns)}")
-    st.info("Your CSV must have columns named: URL, Content (and optionally: Embedding, Category)")
+if raw.empty or raw.shape[1] < 2:
+    st.error("❌ The file needs at least two columns: page URLs and their content.")
     st.stop()
 
-df['URL'] = df['URL'].astype(str).str.strip()
-df['Content'] = df['Content'].where(df['Content'].notna(), '').astype(str)
-df = df[df['Content'].str.strip() != ''].reset_index(drop=True)
+detected = detect_columns(raw)
+NONE = "— none —"
+
+# Column confirmation (auto-detected, user can override)
+with st.expander("🔧 Change columns", expanded=detected['url'] is None or detected['content'] is None):
+    has_header = st.checkbox("First row contains column names", value=detected['header_row'] is not None,
+                             key=f"hdr_{file_id}")
+    header_row = (detected['header_row'] if detected['header_row'] is not None else 0) if has_header else None
+    labels = column_labels(raw, header_row)
+    idx = list(range(raw.shape[1]))
+
+    def pick(label, key, default, optional=False):
+        options = ([None] if optional else []) + idx
+        fmt = lambda c: NONE if c is None else labels[c]
+        start = options.index(default) if default in options else 0
+        return st.selectbox(label, options, index=start, format_func=fmt, key=f"{key}_{file_id}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        url_col = pick("URL column", "url", detected['url'])
+        cat_col = pick("Category column (optional)", "cat", detected['category'], optional=True)
+    with c2:
+        content_col = pick("Content column", "content",
+                           detected['content'] if detected['content'] is not None else (1 if raw.shape[1] > 1 else 0))
+        emb_col = pick("Embedding column (optional)", "emb", detected['embedding'], optional=True)
+
+if url_col == content_col:
+    st.error("❌ URL and Content can't be the same column – open **Change columns** above to fix it.")
+    st.stop()
+
+mapping = dict(header_row=header_row, url=url_col, content=content_col, category=cat_col, embedding=emb_col)
+df, row_stats = build_dataframe(raw, mapping)
+labels = column_labels(raw, header_row)
+
+detected_text = f"URL = **{labels[url_col]}**, Content = **{labels[content_col]}**"
+if cat_col is not None:
+    detected_text += f", Category = **{labels[cat_col]}**"
+if emb_col is not None:
+    detected_text += f", Embeddings = **{labels[emb_col]}**"
+st.success(f"✅ Detected columns: {detected_text}")
+
+skipped = row_stats['no_url'] + row_stats['no_content']
+if skipped:
+    parts = []
+    if row_stats['no_url']:
+        parts.append(f"{row_stats['no_url']} without a URL")
+    if row_stats['no_content']:
+        parts.append(f"{row_stats['no_content']} without content")
+    st.caption(f"ℹ️ {skipped} rows skipped ({', '.join(parts)}).")
 
 if len(df) == 0:
-    st.error("❌ No valid content found in the file. Please check your Content column.")
+    st.error("❌ No rows with both a URL and content were found. Open **Change columns** above and check the selection.")
+    st.stop()
+if len(df) < 2:
+    st.error("❌ At least 2 pages are needed to compare.")
     st.stop()
 if len(df) > 5000:
     st.error(f"❌ File too large: {len(df)} URLs found. Maximum supported: 5,000 URLs")
     st.stop()
 
 # Existing embeddings (tolerant: bad rows just become "missing")
-embedding_col = 'Embedding' if 'Embedding' in df.columns else ('AI Embedding' if 'AI Embedding' in df.columns else None)
-df['Embedding'] = df[embedding_col].apply(parse_embedding) if embedding_col else [None] * len(df)
+embedding_col = 'Embedding' if 'Embedding' in df.columns else None
+df['Embedding'] = df['Embedding'].apply(parse_embedding) if embedding_col else [None] * len(df)
 existing_count = count_valid(df['Embedding'])
 missing_count = len(df) - existing_count
 has_categories = 'Category' in df.columns and not df['Category'].isna().all()
 
 duplicate_urls = int(df['URL'].duplicated().sum())
 
-st.success(f"✅ File uploaded successfully: {len(df)} URLs found")
 c1, c2, c3 = st.columns(3)
-c1.metric("Total URLs", len(df))
+c1.metric("Pages", len(df))
 c2.metric("Existing Embeddings", f"{existing_count}/{len(df)}")
-c3.metric("Has Categories", "Yes ✅" if has_categories else "No ❌")
+c3.metric("Has Categories", "Yes ✅" if has_categories else "No")
 if duplicate_urls:
     st.warning(f"⚠️ {duplicate_urls} duplicate URLs found in the file – they will be compared like separate pages.")
 if embedding_col and 0 < existing_count < len(df):

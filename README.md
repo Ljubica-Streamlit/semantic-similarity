@@ -16,28 +16,23 @@ A Streamlit app that measures semantic similarity between web pages using AI emb
 
 ## Usage
 
-### Input File Format
+### Input File
 
-Your CSV must have these columns:
+Upload a **CSV or Excel (.xlsx)** file with page URLs and their content – **any column order, with or without headers**.
 
-**Required:**
-- `URL` - The page URL
-- `Content` - Full text content of the page
+The app detects the columns automatically by what they contain:
+- **URL** – the column that looks like web addresses (also `site.com/page` or `/blog/post`)
+- **Content** – the column with the longest text
+- **Category** (optional) – a column named e.g. Category, Type, Section, Cluster
+- **Embedding** (optional) – JSON arrays from a previous run; only missing rows are generated
 
-**Optional:**
-- `Category` - Page category for grouping
-- `Embedding` - Pre-computed embedding (JSON array). Rows without one are generated.
-
-**Example:**
-```csv
-URL,Content,Category
-https://example.com/page1,"Full page content here...",Blog
-https://example.com/page2,"More content here...",Product
-```
+Comma, semicolon and tab separated files work, as do SEO-tool exports such as Screaming Frog
+(`Address` / `Body Text`). If a guess is wrong, open **Change columns** and pick the right ones.
+Empty rows and rows without a URL or content are skipped automatically.
 
 ### Analysis Steps
 
-1. **Upload CSV file**
+1. **Upload your CSV or Excel file**
 2. **Enter OpenAI API key** (sidebar)
 3. **Configure options:**
    - Enable/disable TF-IDF

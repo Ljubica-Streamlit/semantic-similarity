@@ -1,577 +1,365 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import json
+import hashlib
 import io
+import json
+import traceback
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
 from utils.embeddings import generate_embeddings, estimate_cost
-from utils.similarity import calculate_similarities, categorize_priority
-from utils.tfidf import calculate_tfidf_similarity
-
-# Page config
-st.set_page_config(
-    page_title="Keyword Cannibalization Analyzer",
-    page_icon="🔍",
-    layout="wide"
+from utils.similarity import (
+    calculate_similarities, calculate_cosine_similarity, categorize_similarity,
+    SIMILARITY_LEVELS, LEVEL_ORDER,
 )
+from utils.tfidf import calculate_tfidf_for_pairs, calculate_tfidf_similarity
+from utils.export import embeddings_csv, results_csv, summary_csv
 
-# Title and description
-st.title("🔍 Keyword Cannibalization Analyzer")
+st.set_page_config(page_title="Semantic Similarity Analyzer", page_icon="🔍", layout="wide")
+
+st.title("🔍 Semantic Similarity Analyzer")
 st.markdown("""
-Analyze semantic similarity between your web pages to identify keyword cannibalization issues.
-Upload your content, and we'll identify pages competing for the same search intent.
+Measure how semantically similar your pages are using AI embeddings.
+Find duplicate, near-duplicate and overlapping content across your site.
 """)
 
-# Sidebar - API Key and Options
+
+# ---------------------------------------------------------------- helpers
+def read_csv_any_encoding(uploaded):
+    raw = uploaded.getvalue()
+    last_err = None
+    for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+        except UnicodeDecodeError as e:
+            last_err = e
+    raise last_err
+
+
+def parse_embedding(x):
+    """Return np.ndarray or None. Never raises."""
+    if isinstance(x, np.ndarray):
+        return x if x.size else None
+    if isinstance(x, str) and x.strip().startswith('['):
+        try:
+            arr = np.array(json.loads(x), dtype=np.float32)
+            return arr if arr.ndim == 1 and arr.size else None
+        except Exception:
+            return None
+    return None
+
+
+def count_valid(series):
+    return int(series.apply(lambda e: isinstance(e, np.ndarray) and e.size > 0).sum())
+
+
+def fmt_pct(x):
+    return f"{x * 100:.2f}%" if pd.notna(x) else "–"
+
+
+# ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("⚙️ Configuration")
-    
-    # API Key input
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        help="Your API key is only used during this session and is never stored."
-    )
-    
+    api_key = st.text_input("OpenAI API Key", type="password",
+                            help="Your API key is only used during this session and is never stored.")
     if api_key:
         st.success("✅ API Key provided")
     else:
-        st.warning("⚠️ Please enter your OpenAI API key")
-    
+        st.info("Enter your OpenAI API key (not needed if your file already has embeddings)")
+
     st.markdown("---")
-    
-    # Options
     st.header("📊 Analysis Options")
-    
-    include_tfidf = st.checkbox(
-        "Include TF-IDF Analysis",
-        value=False,
-        help="Calculate keyword overlap for semantic similarity results."
-    )
-    
-    # Show TF-IDF independently option only when TF-IDF is enabled
+
+    include_tfidf = st.checkbox("Include TF-IDF Analysis", value=False,
+                                help="Calculate keyword overlap for semantic similarity results.")
+    show_tfidf_only_matches = False
     if include_tfidf:
         show_tfidf_only_matches = st.checkbox(
-            "Show Additional TF-IDF Matches",
-            value=False,
-            help="Also show pairs with high keyword overlap (TF-IDF) but low semantic similarity. Helps find pages using similar words but different meanings."
-        )
-    else:
-        show_tfidf_only_matches = False
-    
+            "Show Additional TF-IDF Matches", value=False,
+            help="Also show pairs with high keyword overlap (TF-IDF) but lower semantic similarity.")
+
     similarity_threshold = st.slider(
-        "Semantic Similarity Threshold (%)",
-        min_value=75,
-        max_value=95,
-        value=85,
-        step=5,
-        help="Only show pairs with semantic similarity above this threshold"
-    ) / 100
-    
-    # Add TF-IDF threshold slider if independent mode is enabled
+        "Semantic Similarity Threshold (%)", min_value=70, max_value=99, value=85, step=1,
+        help="Only show pairs with semantic similarity at or above this value") / 100
+
+    tfidf_threshold = similarity_threshold
     if include_tfidf and show_tfidf_only_matches:
-        tfidf_threshold = st.slider(
-            "TF-IDF Similarity Threshold (%)",
-            min_value=30,
-            max_value=95,
-            value=85,
-            step=5,
-            help="Minimum TF-IDF similarity for additional matches"
-        ) / 100
-    else:
-        tfidf_threshold = similarity_threshold  # Use same threshold as AI
-    
+        tfidf_threshold = st.slider("TF-IDF Similarity Threshold (%)", min_value=30, max_value=95,
+                                    value=85, step=5) / 100
+
     st.markdown("---")
-    
-    # Priority Legend
-    st.header("🎯 Priority Levels")
-    st.markdown("""
-    - 🔴 **High Priority:** ≥ 95%
-    - 🟡 **Medium Priority:** 90-95%
-    - 🟢 **Low Priority:** 85-90%
-    """)
-    
+    st.header("🎯 Similarity Levels")
+    st.markdown("\n".join(f"- {label}: {desc}" for _, label, desc in SIMILARITY_LEVELS))
+
     st.markdown("---")
-    
-    # Privacy Notice
     st.info("🔒 **Privacy:** Your data and API key are processed in-memory only and never stored on our servers.")
 
-# Main content area
+
+# ---------------------------------------------------------------- upload
 st.header("📤 Upload Your Data")
-
 uploaded_file = st.file_uploader(
-    "Upload CSV file with your content",
-    type=['csv'],
-    help="Required: URL, Content. Optional: Embedding (JSON array), Category"
-)
+    "Upload CSV file with your content", type=['csv'],
+    help="Required: URL, Content. Optional: Embedding (JSON array), Category")
 
-if uploaded_file:
-    try:
-        # Read the CSV
-        df = pd.read_csv(uploaded_file)
-        
-        # Validate required columns
-        required_columns = ['URL', 'Content']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        if missing_columns:
-            st.error(f"❌ Missing required columns: {', '.join(missing_columns)}")
-            st.info("Your CSV must have columns named: URL, Content (and optionally: Embedding, Category)")
-            st.stop()
-        
-        # Check if embeddings already exist in the file
-        has_embeddings = 'Embedding' in df.columns or 'AI Embedding' in df.columns
-        
-        if has_embeddings:
-            # Determine which column name is used
-            embedding_col = 'Embedding' if 'Embedding' in df.columns else 'AI Embedding'
-            
-            # Parse embeddings from JSON strings to numpy arrays
-            try:
-                df['Embedding'] = df[embedding_col].apply(
-                    lambda x: np.array(json.loads(x)) if pd.notna(x) and isinstance(x, str) else x
-                )
-                # Count valid embeddings
-                valid_embeddings = df['Embedding'].apply(
-                    lambda x: isinstance(x, np.ndarray) and len(x) > 0
-                ).sum()
-                
-                if valid_embeddings > 0:
-                    st.info(f"✅ Found {valid_embeddings} existing embeddings in file - will skip embedding generation!")
-                else:
-                    has_embeddings = False
-                    st.warning("⚠️ Embedding column found but no valid embeddings detected")
-            except Exception as e:
-                has_embeddings = False
-                st.warning(f"⚠️ Could not parse embeddings: {str(e)}")
-        
-        # Check if Category column exists
-        has_categories = 'Category' in df.columns and not df['Category'].isna().all()
-        
-        # Remove rows with empty content
-        df = df[df['Content'].notna() & (df['Content'].str.strip() != '')]
-        
-        if len(df) == 0:
-            st.error("❌ No valid content found in the file. Please check your Content column.")
-            st.stop()
-        
-        if len(df) > 5000:
-            st.error(f"❌ File too large: {len(df)} URLs found. Maximum supported: 5,000 URLs")
-            st.info("Please split your data into smaller batches for analysis.")
-            st.stop()
-        
-        # Display file info
-        st.success(f"✅ File uploaded successfully: {len(df)} URLs found")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total URLs", len(df))
-        with col2:
-            st.metric("Has Embeddings", "Yes ✅" if has_embeddings else "No ❌")
-        with col3:
-            st.metric("Has Categories", "Yes ✅" if has_categories else "No ❌")
-        
-        # Show preview
-        with st.expander("📋 Preview Data (first 5 rows)"):
-            st.dataframe(df.head())
-        
-        # Cost estimation
-        if api_key or has_embeddings:
-            st.header("💰 Cost Estimation")
-            
-            if has_embeddings:
-                st.success("✅ Using existing embeddings - No API cost for embedding generation!")
-                estimated_cost = 0
-            else:
-                estimated_cost = estimate_cost(df)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if has_embeddings:
-                    st.metric("Estimated OpenAI Cost", "$0.00 (Using existing embeddings)")
-                else:
-                    st.metric("Estimated OpenAI Cost", f"${estimated_cost:.4f}")
-            with col2:
-                total_comparisons = (len(df) * (len(df) - 1)) // 2
-                st.metric("Total Comparisons", f"{total_comparisons:,}")
-            
-            if include_tfidf:
-                st.info("✅ TF-IDF analysis is free (no API costs)")
-            
-            st.markdown("---")
-            
-            # Analysis button
-            if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
-                if not api_key and not has_embeddings:
-                    st.error("❌ Please provide your OpenAI API key in the sidebar or upload a file with existing embeddings")
-                    st.stop()
-                
-                # Start analysis
-                st.header("⚙️ Processing...")
-                
-                # Step 1: Generate embeddings (only if needed)
-                if not has_embeddings:
-                    with st.spinner("Step 1/3: Generating AI embeddings..."):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        embeddings_result = generate_embeddings(
-                            df, 
-                            api_key,
-                            progress_callback=lambda current, total, progress_value: (
-                                progress_bar.progress(progress_value),
-                                status_text.text(f"Processing {current}/{total} pages...")
-                            )
-                        )
-                        
-                        if embeddings_result['success']:
-                            # Report skipped rows if any
-                            skipped = embeddings_result.get('skipped_rows', [])
-                            if skipped:
-                                st.warning(f"⚠️ {len(skipped)} pages were skipped due to errors after retries.")
-                                with st.expander(f"View {len(skipped)} skipped pages"):
-                                    for s in skipped:
-                                        st.text(f"Row {s['row']}: {s['url']}")
-                            
-                            df['Embedding'] = embeddings_result['embeddings']
-                            valid_count = sum(1 for e in embeddings_result['embeddings'] if e is not None)
-                            st.success(f"✅ Generated {valid_count}/{len(df)} embeddings")
-                        else:
-                            st.error(f"❌ Error: {embeddings_result['error']}")
-                            
-                            # Offer download of partial embeddings if any were generated
-                            partial = embeddings_result.get('partial_embeddings', [])
-                            if partial:
-                                st.warning(f"💾 {len(partial)} embeddings were generated before the error. Download them to avoid paying again.")
-                                
-                                # Build partial embeddings JSON keyed by URL
-                                partial_dict = {}
-                                for i, emb in enumerate(partial):
-                                    if i < len(df) and isinstance(emb, np.ndarray):
-                                        url = df.iloc[i]['URL']
-                                        partial_dict[url] = emb.tolist()
-                                
-                                if partial_dict:
-                                    partial_json = json.dumps(partial_dict, indent=2)
-                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                    st.download_button(
-                                        label=f"📥 Download {len(partial_dict)} Partial Embeddings (JSON)",
-                                        data=partial_json,
-                                        file_name=f"partial_embeddings_{timestamp}.json",
-                                        mime="application/json",
-                                        use_container_width=True
-                                    )
-                                    st.info("💡 **Tip:** To resume later, add an 'Embedding' column to your CSV with these values, or upload this JSON alongside your data.")
-                            
-                            st.stop()
-                else:
-                    st.info("⏭️ Step 1/3: Using existing embeddings - skipped generation")
-                
-                # Step 2: Calculate semantic similarities
-                with st.spinner("Step 2/3: Calculating semantic similarities..."):
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    results = calculate_similarities(
-                        df,
-                        threshold=similarity_threshold,
-                        progress_callback=lambda current, total: (
-                            progress_bar.progress(min(current / total, 1.0)),
-                            status_text.text(f"Comparing {current}/{total} pairs...")
-                        )
-                    )
-                    
-                    st.success(f"✅ Found {len(results)} pairs above {similarity_threshold*100}% semantic similarity threshold")
-                
-                # Step 3: TF-IDF analysis
-                if include_tfidf:
-                    with st.spinner("Step 3/3: Calculating TF-IDF for results..."):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        # Create list of URL pairs from semantic similarity results
-                        semantic_pairs = [(r['URL 1'], r['URL 2']) for r in results]
-                        
-                        # Calculate TF-IDF only for semantic similarity pairs
-                        from utils.tfidf import calculate_tfidf_for_pairs
-                        tfidf_scores = calculate_tfidf_for_pairs(
-                            df,
-                            semantic_pairs,
-                            progress_callback=lambda current, total: (
-                                progress_bar.progress(min(current / total, 1.0)),
-                                status_text.text(f"Calculating TF-IDF for {current}/{total} pairs...")
-                            )
-                        )
-                        
-                        # Add TF-IDF scores to results
-                        for result in results:
-                            key = tuple(sorted([result['URL 1'], result['URL 2']]))
-                            result['TF-IDF Similarity'] = tfidf_scores.get(key, 0.0)
-                        
-                        # If show_tfidf_only_matches is enabled, find additional pairs
-                        additional_pairs = []
-                        if show_tfidf_only_matches:
-                            status_text.text("Finding additional TF-IDF matches...")
-                            
-                            # Calculate TF-IDF for all pairs
-                            all_tfidf_results = calculate_tfidf_similarity(
-                                df,
-                                threshold=tfidf_threshold,
-                                progress_callback=None
-                            )
-                            
-                            # Filter to only pairs NOT already in semantic results
-                            existing_pairs = {tuple(sorted([r['URL 1'], r['URL 2']])) for r in results}
-                            
-                            for tfidf_result in all_tfidf_results:
-                                pair_key = tuple(sorted([tfidf_result['URL 1'], tfidf_result['URL 2']]))
-                                if pair_key not in existing_pairs:
-                                    # This is a TF-IDF match that wasn't in semantic results
-                                    # Get the semantic similarity for this pair
-                                    url1, url2 = tfidf_result['URL 1'], tfidf_result['URL 2']
-                                    
-                                    # Find these URLs in the dataframe
-                                    idx1 = df[df['URL'] == url1].index[0]
-                                    idx2 = df[df['URL'] == url2].index[0]
-                                    
-                                    # Calculate semantic similarity for this pair
-                                    from utils.similarity import calculate_cosine_similarity
-                                    emb1 = df.loc[idx1, 'Embedding']
-                                    emb2 = df.loc[idx2, 'Embedding']
-                                    semantic_sim = calculate_cosine_similarity(emb1, emb2)
-                                    
-                                    additional_pairs.append({
-                                        'URL 1': url1,
-                                        'URL 2': url2,
-                                        'Semantic Similarity': semantic_sim,
-                                        'TF-IDF Similarity': tfidf_result['TF-IDF Similarity']
-                                    })
-                            
-                            if additional_pairs:
-                                st.info(f"✅ Found {len(additional_pairs)} additional pairs with high TF-IDF but low semantic similarity")
-                        
-                        st.success(f"✅ TF-IDF analysis complete")
-                else:
-                    st.info("⏭️ Step 3/3: TF-IDF analysis skipped")
-                
-                # Combine results
-                if include_tfidf and show_tfidf_only_matches and additional_pairs:
-                    # Add additional pairs to results
-                    results.extend(additional_pairs)
-                    st.info(f"📊 Total results: {len(results)} pairs ({len(results) - len(additional_pairs)} semantic + {len(additional_pairs)} TF-IDF only)")
-                
-                if len(results) == 0:
-                    st.warning(f"⚠️ No similar pairs found above {similarity_threshold*100}% threshold. Try lowering the threshold.")
-                    st.stop()
-                
-                # Create results dataframe
-                results_df = pd.DataFrame(results)
-                
-                # Add priority categorization based on semantic similarity
-                results_df['Priority'] = results_df['Semantic Similarity'].apply(categorize_priority)
-                
-                # Display results
-                st.header("📊 Analysis Results")
-                
-                # Summary statistics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    high_priority = len(results_df[results_df['Priority'] == '🔴 High Priority'])
-                    st.metric("High Priority", high_priority)
-                with col2:
-                    medium_priority = len(results_df[results_df['Priority'] == '🟡 Medium Priority'])
-                    st.metric("Medium Priority", medium_priority)
-                with col3:
-                    low_priority = len(results_df[results_df['Priority'] == '🟢 Low Priority'])
-                    st.metric("Low Priority", low_priority)
-                with col4:
-                    avg_similarity = results_df['Semantic Similarity'].mean()
-                    st.metric("Avg Semantic Similarity", f"{avg_similarity*100:.1f}%")
-                
-                # Priority distribution chart
-                st.subheader("📈 Priority Distribution")
-                priority_counts = results_df['Priority'].value_counts()
-                st.bar_chart(priority_counts)
-                
-                # Top 10 results preview
-                st.subheader("🔝 Top 10 Similar Pairs")
-                
-                # Show TF-IDF statistics if available
-                if include_tfidf and 'TF-IDF Similarity' in results_df.columns:
-                    tfidf_numeric = results_df['TF-IDF Similarity']
-                    if len(tfidf_numeric) > 0:
-                        st.info(f"📊 TF-IDF Stats: All {len(tfidf_numeric)} pairs analyzed (avg: {tfidf_numeric.mean()*100:.1f}%)")
-                
-                # Format for display
-                display_df = results_df.head(10).copy()
-                display_df['Semantic Similarity'] = display_df['Semantic Similarity'].apply(lambda x: f"{x*100:.2f}%")
-                if include_tfidf and 'TF-IDF Similarity' in display_df.columns:
-                    display_df['TF-IDF Similarity'] = display_df['TF-IDF Similarity'].apply(
-                        lambda x: f"{x*100:.2f}%"
-                    )
-                
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Download buttons
-                st.header("⬇️ Download Results")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Create Excel file
-                    output = io.BytesIO()
-                    
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        # Sheet 1: Original Data + Embeddings
-                        export_df = df.copy()
-                        export_df['AI Embedding'] = export_df['Embedding'].apply(
-                            lambda x: json.dumps(x.tolist()) if isinstance(x, np.ndarray) else str(x)
-                        )
-                        export_df = export_df.drop('Embedding', axis=1)
-                        
-                        # Reorder columns
-                        cols = ['URL', 'Content']
-                        if has_categories:
-                            cols.append('Category')
-                        cols.append('AI Embedding')
-                        
-                        export_df = export_df[cols]
-                        export_df.to_excel(writer, sheet_name='Original Data + Embeddings', index=False)
-                        
-                        # Sheet 2: Analysis Results
-                        results_export = results_df.copy()
-                        results_export.to_excel(writer, sheet_name='Similarity Analysis', index=False)
-                        
-                        # Sheet 3: Summary Statistics
-                        summary_data = {
-                            'Metric': [
-                                'Total URLs Analyzed',
-                                'Total Similar Pairs Found',
-                                'High Priority Pairs (≥95%)',
-                                'Medium Priority Pairs (90-95%)',
-                                'Low Priority Pairs (85-90%)',
-                                '',
-                                'Average Semantic Similarity',
-                                'Maximum Semantic Similarity',
-                                'Minimum Semantic Similarity',
-                                '',
-                                'Semantic Similarity Threshold Used',
-                                'TF-IDF Analysis Included',
-                                'Embeddings Pre-existing',
-                                'Categories Provided'
-                            ],
-                            'Value': [
-                                len(df),
-                                len(results_df),
-                                high_priority,
-                                medium_priority,
-                                low_priority,
-                                '',
-                                f"{results_df['Semantic Similarity'].mean()*100:.2f}%",
-                                f"{results_df['Semantic Similarity'].max()*100:.2f}%",
-                                f"{results_df['Semantic Similarity'].min()*100:.2f}%",
-                                '',
-                                f"{similarity_threshold*100}%",
-                                'Yes' if include_tfidf else 'No',
-                                'Yes' if has_embeddings else 'No',
-                                'Yes' if has_categories else 'No'
-                            ]
-                        }
-                        summary_df = pd.DataFrame(summary_data)
-                        summary_df.to_excel(writer, sheet_name='Summary', index=False)
-                    
-                    output.seek(0)
-                    
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    
-                    st.download_button(
-                        label="📥 Download Excel Results",
-                        data=output,
-                        file_name=f"cannibalization_analysis_{timestamp}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                
-                with col2:
-                    # Create JSON embeddings file
-                    embeddings_dict = {}
-                    for idx, row in df.iterrows():
-                        url = row['URL']
-                        embedding = row['Embedding']
-                        if isinstance(embedding, np.ndarray):
-                            embeddings_dict[url] = embedding.tolist()
-                    
-                    embeddings_json = json.dumps(embeddings_dict, indent=2)
-                    
-                    st.download_button(
-                        label="📥 Download Embeddings JSON",
-                        data=embeddings_json,
-                        file_name=f"embeddings_{timestamp}.json",
-                        mime="application/json",
-                        use_container_width=True,
-                        help="Download embeddings for reuse in future analyses"
-                    )
-                
-                st.success("✅ Analysis complete! Download your results above.")
-        
-        else:
-            st.info("👆 Please enter your OpenAI API key in the sidebar to continue")
-    
-    except Exception as e:
-        st.error(f"❌ Error reading file: {str(e)}")
-        st.info("Please ensure your CSV has the correct format with 'URL' and 'Content' columns.")
-
-else:
-    # Instructions when no file uploaded
+if not uploaded_file:
+    st.session_state.pop('run', None)
     st.info("👆 Upload your CSV file to begin analysis")
-    
     st.markdown("### 📝 CSV Format Requirements")
     st.markdown("""
-    Your CSV file must contain:
-    - **URL** (required): The page URL
-    - **Content** (required): The full text content of the page
-    - **Embedding** (optional): Pre-computed AI embedding as JSON array - saves API costs!
-    - **Category** (optional): Page category for grouping
-    
-    **Example - Basic:**
-```csv
-    URL,Content,Category
-    https://example.com/page1,"Full page content here...",Blog
-    https://example.com/page2,"More content here...",Product
-```
-    
-    **Example - With Embeddings (no API key needed!):**
-```csv
-    URL,Content,Embedding,Category
-    https://example.com/page1,"Content...","[0.123, -0.456, ...]",Blog
-    https://example.com/page2,"Content...","[0.789, -0.012, ...]",Product
-```
-    """)
-    
-    st.markdown("### ✨ New Features")
-    st.markdown("""
-    - **Reuse Embeddings**: Upload files with existing embeddings to skip API costs
-    - **Independent TF-IDF**: Find keyword cannibalization even when semantic similarity is low
-    - **Flexible Analysis**: Mix and match AI and TF-IDF results for comprehensive insights
-    """)
-    
+Your CSV file must contain:
+- **URL** (required): The page URL
+- **Content** (required): The full text content of the page
+- **Embedding** (optional): Pre-computed embedding as JSON array – saves API costs!
+- **Category** (optional): Page category for grouping
+
+**Tip:** The *Data + Embeddings CSV* you download after an analysis can be uploaded again as-is –
+no new API cost. If some rows are missing embeddings, only those rows are generated.
+""")
     st.markdown("### 🔑 API Key")
     st.markdown("""
-    You'll need an OpenAI API key to use this tool. Get one at [platform.openai.com](https://platform.openai.com/api-keys).
-    
-    **Cost:** Approximately $0.02 per 1,000 pages analyzed.
-    
-    **Tip:** Download the embeddings from your first analysis to reuse them later without additional API costs!
-    """)
+You'll need an OpenAI API key. Get one at [platform.openai.com](https://platform.openai.com/api-keys).
 
-# Footer
+**Cost:** approximately $0.02 per 1,000 pages.
+""")
+    st.markdown("---")
+    st.markdown("<div style='text-align:center;color:#666'>Built with Streamlit • Powered by OpenAI • "
+                "Your data is never stored</div>", unsafe_allow_html=True)
+    st.stop()
+
+# Reset stored results when a different file is uploaded
+file_id = hashlib.md5(uploaded_file.getvalue()).hexdigest()
+if st.session_state.get('file_id') != file_id:
+    st.session_state['file_id'] = file_id
+    st.session_state.pop('run', None)
+
+try:
+    df = read_csv_any_encoding(uploaded_file)
+except Exception as e:
+    st.error(f"❌ Could not read the CSV file: {e}")
+    st.info("Please make sure the file is a valid CSV with 'URL' and 'Content' columns.")
+    st.stop()
+
+df.columns = [str(c).strip() for c in df.columns]
+missing_columns = [c for c in ('URL', 'Content') if c not in df.columns]
+if missing_columns:
+    st.error(f"❌ Missing required columns: {', '.join(missing_columns)}")
+    st.info("Your CSV must have columns named: URL, Content (and optionally: Embedding, Category)")
+    st.stop()
+
+df['URL'] = df['URL'].astype(str).str.strip()
+df['Content'] = df['Content'].where(df['Content'].notna(), '').astype(str)
+df = df[df['Content'].str.strip() != ''].reset_index(drop=True)
+
+if len(df) == 0:
+    st.error("❌ No valid content found in the file. Please check your Content column.")
+    st.stop()
+if len(df) > 5000:
+    st.error(f"❌ File too large: {len(df)} URLs found. Maximum supported: 5,000 URLs")
+    st.stop()
+
+# Existing embeddings (tolerant: bad rows just become "missing")
+embedding_col = 'Embedding' if 'Embedding' in df.columns else ('AI Embedding' if 'AI Embedding' in df.columns else None)
+df['Embedding'] = df[embedding_col].apply(parse_embedding) if embedding_col else [None] * len(df)
+existing_count = count_valid(df['Embedding'])
+missing_count = len(df) - existing_count
+has_categories = 'Category' in df.columns and not df['Category'].isna().all()
+
+duplicate_urls = int(df['URL'].duplicated().sum())
+
+st.success(f"✅ File uploaded successfully: {len(df)} URLs found")
+c1, c2, c3 = st.columns(3)
+c1.metric("Total URLs", len(df))
+c2.metric("Existing Embeddings", f"{existing_count}/{len(df)}")
+c3.metric("Has Categories", "Yes ✅" if has_categories else "No ❌")
+if duplicate_urls:
+    st.warning(f"⚠️ {duplicate_urls} duplicate URLs found in the file – they will be compared like separate pages.")
+if embedding_col and 0 < existing_count < len(df):
+    st.info(f"ℹ️ {missing_count} rows have no embedding – only those will be generated.")
+
+with st.expander("📋 Preview Data (first 5 rows)"):
+    st.dataframe(df.drop(columns=['Embedding']).head())
+
+if missing_count and not api_key:
+    st.info("👆 Please enter your OpenAI API key in the sidebar to continue")
+    st.stop()
+
+# ---------------------------------------------------------------- cost
+st.header("💰 Cost Estimation")
+c1, c2 = st.columns(2)
+c1.metric("Estimated OpenAI Cost",
+          "$0.00 (Using existing embeddings)" if missing_count == 0 else f"${estimate_cost(df, missing_count):.4f}")
+c2.metric("Total Comparisons", f"{(len(df) * (len(df) - 1)) // 2:,}")
+if include_tfidf:
+    st.info("✅ TF-IDF analysis is free (no API costs)")
 st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666;'>
-    <p>Built with Streamlit • Powered by OpenAI • Your data is never stored</p>
-</div>
-""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------- analysis
+def run_analysis(df):
+    """Runs every step. Stores progress in session_state so nothing paid for is lost."""
+    run = {'df': df, 'results_df': None, 'errors': [], 'warnings': [], 'new_embeddings': 0,
+           'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+           'settings': dict(threshold=similarity_threshold, tfidf=include_tfidf)}
+    st.session_state['run'] = run
+
+    # Step 1 – embeddings
+    if missing_count:
+        progress = st.progress(0.0, text="Step 1/3: Generating AI embeddings...")
+        emb = generate_embeddings(
+            df, api_key, existing=df['Embedding'].tolist(),
+            progress_callback=lambda done, total, p: progress.progress(p, text=f"Step 1/3: Embedding {done}/{total} pages..."))
+        df['Embedding'] = emb['embeddings']
+        run['new_embeddings'] = emb['new_count']
+        if emb['skipped_rows']:
+            run['warnings'].append(
+                f"{len(emb['skipped_rows'])} pages could not be embedded and were left out: " +
+                ", ".join(s['url'] for s in emb['skipped_rows'][:20]) +
+                (" ..." if len(emb['skipped_rows']) > 20 else ""))
+        if emb['error']:
+            run['errors'].append(f"Embedding stopped: {emb['error']}")
+            return
+    else:
+        st.info("⏭️ Step 1/3: Using existing embeddings – skipped generation")
+
+    # Step 2 – semantic similarity
+    try:
+        progress = st.progress(0.0, text="Step 2/3: Calculating semantic similarities...")
+        results = calculate_similarities(
+            df, threshold=similarity_threshold,
+            progress_callback=lambda cur, tot: progress.progress(min(cur / tot, 1.0), text=f"Step 2/3: Compared {cur}/{tot} pages..."))
+    except Exception as e:
+        run['errors'].append(f"Similarity calculation failed: {e}")
+        run['trace'] = traceback.format_exc()
+        return
+
+    # Step 3 – TF-IDF (optional; failure here never discards semantic results)
+    if include_tfidf and results:
+        try:
+            progress = st.progress(0.0, text="Step 3/3: Calculating TF-IDF...")
+            pairs = [(r['URL 1'], r['URL 2']) for r in results]
+            scores = calculate_tfidf_for_pairs(
+                df, pairs,
+                progress_callback=lambda cur, tot: progress.progress(min(cur / tot, 1.0), text=f"Step 3/3: TF-IDF {cur}/{tot} pairs..."))
+            for r in results:
+                r['TF-IDF Similarity'] = scores.get(tuple(sorted([r['URL 1'], r['URL 2']])), 0.0)
+
+            if show_tfidf_only_matches:
+                existing_pairs = set(scores.keys())
+                emb_by_url = {}
+                for u, e in zip(df['URL'], df['Embedding']):
+                    emb_by_url.setdefault(u, e)
+                for t in calculate_tfidf_similarity(df, threshold=tfidf_threshold):
+                    key = tuple(sorted([t['URL 1'], t['URL 2']]))
+                    if key in existing_pairs:
+                        continue
+                    e1, e2 = emb_by_url.get(t['URL 1']), emb_by_url.get(t['URL 2'])
+                    sem = calculate_cosine_similarity(e1, e2) if (isinstance(e1, np.ndarray) and isinstance(e2, np.ndarray)) else np.nan
+                    results.append({'URL 1': t['URL 1'], 'URL 2': t['URL 2'],
+                                    'Semantic Similarity': sem, 'TF-IDF Similarity': t['TF-IDF Similarity'],
+                                    'Match Type': 'TF-IDF only'})
+        except Exception as e:
+            run['warnings'].append(f"TF-IDF analysis failed and was skipped: {e}")
+
+    if results:
+        results_df = pd.DataFrame(results)
+        results_df.insert(2, 'Similarity Level',
+                          results_df['Semantic Similarity'].apply(lambda s: categorize_similarity(s) if pd.notna(s) else '–'))
+        run['results_df'] = results_df
+
+
+if st.button("🚀 Start Analysis", type="primary", width="stretch"):
+    try:
+        run_analysis(df.copy())
+    except Exception as e:
+        run = st.session_state.setdefault('run', {'df': df, 'results_df': None, 'errors': [], 'warnings': [],
+                                                   'new_embeddings': 0, 'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")})
+        run['errors'].append(f"Unexpected error: {e}")
+        run['trace'] = traceback.format_exc()
+
+
+# ---------------------------------------------------------------- results (persist across reruns)
+run = st.session_state.get('run')
+if run:
+    rdf = run['df']
+    ts = run['timestamp']
+    n_emb = count_valid(rdf['Embedding'])
+
+    for w in run['warnings']:
+        st.warning(f"⚠️ {w}")
+    for e in run['errors']:
+        st.error(f"❌ {e}")
+    if run.get('trace'):
+        with st.expander("Technical details"):
+            st.code(run['trace'])
+
+    # Embeddings are always offered first – the user paid for them
+    st.header("⬇️ Download")
+    if n_emb:
+        if run['errors']:
+            st.info(f"💾 Your {n_emb} embeddings are saved below. Upload this CSV again to continue "
+                    f"without paying for them twice.")
+        try:
+            st.download_button(
+                label=f"📥 Data + Embeddings CSV ({n_emb}/{len(rdf)} pages)",
+                data=embeddings_csv(rdf, has_categories),
+                file_name=f"embeddings_{ts}.csv", mime="text/csv",
+                width="stretch", key="dl_embeddings",
+                help="Re-upload this file later to skip embedding costs")
+        except Exception as e:
+            st.error(f"❌ Could not build the embeddings file: {e}")
+
+    results_df = run['results_df']
+    if results_df is None:
+        if not run['errors']:
+            st.warning(f"⚠️ No similar pairs found at or above {similarity_threshold * 100:.0f}%. "
+                       f"Try lowering the threshold.")
+        st.stop()
+
+    level_counts = results_df['Similarity Level'].value_counts()
+    summary_rows = [
+        ('Total URLs Analyzed', len(rdf)),
+        ('URLs With Embeddings', n_emb),
+        ('New Embeddings Generated', run['new_embeddings']),
+        ('Similar Pairs Found', len(results_df)),
+    ] + [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER] + [
+        ('Average Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].mean())),
+        ('Maximum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].max())),
+        ('Minimum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].min())),
+        ('Similarity Threshold Used', f"{run['settings']['threshold'] * 100:.0f}%"),
+        ('TF-IDF Analysis Included', 'Yes' if run['settings']['tfidf'] else 'No'),
+    ]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("📥 Similarity Results CSV", data=results_csv(results_df),
+                           file_name=f"similarity_results_{ts}.csv", mime="text/csv",
+                           width="stretch", key="dl_results")
+    with c2:
+        st.download_button("📥 Summary CSV", data=summary_csv(summary_rows),
+                           file_name=f"similarity_summary_{ts}.csv", mime="text/csv",
+                           width="stretch", key="dl_summary")
+
+    st.header("📊 Analysis Results")
+    shown_levels = [l for l in LEVEL_ORDER if level_counts.get(l, 0) > 0]
+    cols = st.columns(max(len(shown_levels), 1) + 1)
+    for col, label in zip(cols, shown_levels):
+        col.metric(label, int(level_counts[label]))
+    cols[-1].metric("Avg Similarity", fmt_pct(results_df['Semantic Similarity'].mean()))
+
+    st.subheader("📈 Similarity Level Distribution")
+    dist = pd.DataFrame({'Pairs': [int(level_counts.get(l, 0)) for l in LEVEL_ORDER]}, index=LEVEL_ORDER)
+    st.bar_chart(dist[dist['Pairs'] > 0])
+
+    st.subheader("🔝 Top 10 Most Similar Pairs")
+    display_df = results_df.head(10).copy()
+    display_df['Semantic Similarity'] = display_df['Semantic Similarity'].apply(fmt_pct)
+    if 'TF-IDF Similarity' in display_df.columns:
+        display_df['TF-IDF Similarity'] = display_df['TF-IDF Similarity'].apply(fmt_pct)
+    st.dataframe(display_df, width="stretch", hide_index=True)
+
+    st.success("✅ Analysis complete! Download your results above.")
+
+st.markdown("---")
+st.markdown("<div style='text-align:center;color:#666'>Built with Streamlit • Powered by OpenAI • "
+            "Your data is never stored</div>", unsafe_allow_html=True)

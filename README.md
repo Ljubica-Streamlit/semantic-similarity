@@ -1,16 +1,16 @@
-# Keyword Cannibalization Analyzer
+# Semantic Similarity Analyzer
 
-A Streamlit app that analyzes semantic similarity between web pages to identify keyword cannibalization issues using AI embeddings.
+A Streamlit app that measures semantic similarity between web pages using AI embeddings – find duplicate, near-duplicate and overlapping content.
 
 ## Features
 
 - 🔍 **AI-Powered Analysis** - Uses OpenAI embeddings for semantic similarity
 - 📊 **TF-IDF Support** - Optional keyword overlap analysis
-- 🎯 **Priority Levels** - Automatic categorization (High/Medium/Low)
+- 🎯 **Similarity Levels** - Duplicate, Near-duplicate, Very similar, Similar, Related, Loosely related
 - 📈 **Progress Tracking** - Real-time progress bars
 - 💰 **Cost Estimation** - Know the cost before running
-- 📥 **Excel Export** - Download results with multiple sheets
-- 🔄 **Reusable Embeddings** - Save embeddings for future use
+- 📥 **CSV Export** - Results, summary and embeddings as CSV files
+- 🔄 **Reusable Embeddings** - Re-upload the embeddings CSV to skip API costs; embeddings are always downloadable, even if the analysis fails
 - 🔒 **Privacy First** - No data stored on servers
 
 
@@ -26,6 +26,7 @@ Your CSV must have these columns:
 
 **Optional:**
 - `Category` - Page category for grouping
+- `Embedding` - Pre-computed embedding (JSON array). Rows without one are generated.
 
 **Example:**
 ```csv
@@ -43,18 +44,26 @@ https://example.com/page2,"More content here...",Product
    - Adjust similarity threshold
 4. **Click "Start Analysis"**
 5. **Download results:**
-   - Excel file with 3 sheets
-   - JSON file with embeddings
+   - Data + Embeddings CSV
+   - Similarity Results CSV
+   - Summary CSV
 
 ### Output Files
 
-**Excel file contains:**
-- **Sheet 1:** Original data + AI embeddings
-- **Sheet 2:** Similarity analysis results
-- **Sheet 3:** Summary statistics
+- **Data + Embeddings CSV:** URL, Content, Category, Embedding – upload it again to reuse embeddings
+- **Similarity Results CSV:** URL pairs, similarity level, semantic (and TF-IDF) similarity in %
+- **Summary CSV:** totals per similarity level and key statistics
 
-**JSON file contains:**
-- Embeddings for each URL (reusable)
+### Similarity Levels
+
+| Level | Semantic similarity |
+|---|---|
+| 🟥 Duplicate | 100% |
+| 🔴 Near-duplicate | 98–99.9% |
+| 🟠 Very similar | 95–98% |
+| 🟡 Similar | 90–95% |
+| 🟢 Related | 85–90% |
+| ⚪ Loosely related | below 85% |
 
 ## Cost
 
@@ -64,7 +73,7 @@ https://example.com/page2,"More content here...",Product
 ## Limits
 
 - **Maximum:** 5,000 URLs per analysis
-- **Threshold:** 75-95% similarity range
+- **Threshold:** 70-99% similarity range
 
 ## Privacy & Security
 

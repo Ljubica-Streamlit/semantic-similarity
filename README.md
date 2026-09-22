@@ -9,7 +9,7 @@ A Streamlit app that measures semantic similarity between web pages using AI emb
 - 🎯 **Similarity Levels** - Duplicate, Near-duplicate, Very similar, Similar, Related, Loosely related
 - 📈 **Progress Tracking** - Real-time progress bars
 - 💰 **Cost Estimation** - Know the cost before running
-- 📥 **CSV Export** - Results, summary and embeddings as CSV files
+- 📥 **One Excel download** - Results, summary and embeddings in one file (CSV versions also available)
 - 🔄 **Reusable Embeddings** - Re-upload the embeddings CSV to skip API costs; embeddings are always downloadable, even if the analysis fails
 - 🔒 **Privacy First** - No data stored on servers
 
@@ -39,15 +39,17 @@ Empty rows and rows without a URL or content are skipped automatically.
    - Adjust similarity threshold
 4. **Click "Start Analysis"**
 5. **Download results:**
-   - Data + Embeddings CSV
-   - Similarity Results CSV
-   - Summary CSV
+   - One Excel file with 3 sheets (CSV versions available too)
 
 ### Output Files
 
-- **Data + Embeddings CSV:** URL, Content, Category, Embedding – upload it again to reuse embeddings
-- **Similarity Results CSV:** URL pairs, similarity level, semantic (and TF-IDF) similarity in %
-- **Summary CSV:** totals per similarity level and key statistics
+One Excel file (`semantic_similarity_<date>.xlsx`) with three sheets:
+- **Similarity Results:** URL pairs, similarity level, semantic (and TF-IDF) similarity in %
+- **Summary:** totals per similarity level and key statistics
+- **Data + Embeddings:** URL, Content, Category, Embedding – upload the file again to reuse embeddings
+
+If the analysis stops early (e.g. OpenAI quota), the file still contains every embedding generated so far.
+The same data is available as separate CSV files under *Prefer CSV files?*.
 
 ### Similarity Levels
 

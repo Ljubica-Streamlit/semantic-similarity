@@ -40,8 +40,9 @@ def load_table(file_name, raw_bytes):
     name = file_name.lower()
     if name.endswith(('.xlsx', '.xlsm', '.xls')):
         sheets = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, header=None, dtype=object)
-        # pick the sheet with the most filled cells
-        df = max(sheets.values(), key=lambda s: s.notna().sum().sum())
+        # A re-uploaded results file: use its data sheet. Otherwise the sheet with the most filled cells.
+        data_sheet = next((n for n in sheets if 'embedding' in str(n).lower()), None)
+        df = sheets[data_sheet] if data_sheet else max(sheets.values(), key=lambda s: s.notna().sum().sum())
     else:
         df = _read_csv(raw_bytes)
     df = df.dropna(how='all').dropna(axis=1, how='all').reset_index(drop=True)

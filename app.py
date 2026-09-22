@@ -14,7 +14,7 @@ from utils.similarity import (
     SIMILARITY_LEVELS, LEVEL_ORDER,
 )
 from utils.tfidf import calculate_tfidf_for_pairs, calculate_tfidf_similarity
-from utils.export import embeddings_csv, results_csv, summary_csv
+from utils.export import embeddings_csv, results_csv, summary_csv, excel_workbook, embeddings_frame, results_frame
 from utils.columns import load_table, detect_columns, column_labels, build_dataframe
 
 st.set_page_config(page_title="Semantic Similarity Analyzer", page_icon="🔍", layout="wide")
@@ -302,7 +302,8 @@ if st.button("🚀 Start Analysis", type="primary", width="stretch"):
         run_analysis(df.copy())
     except Exception as e:
         run = st.session_state.setdefault('run', {'df': df, 'results_df': None, 'errors': [], 'warnings': [],
-                                                   'new_embeddings': 0, 'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")})
+                                                   'new_embeddings': 0, 'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                                   'settings': dict(threshold=similarity_threshold, tfidf=include_tfidf)})
         run['errors'].append(f"Unexpected error: {e}")
         run['trace'] = traceback.format_exc()
 
@@ -322,52 +323,76 @@ if run:
         with st.expander("Technical details"):
             st.code(run['trace'])
 
-    # Embeddings are always offered first – the user paid for them
-    st.header("⬇️ Download")
-    if n_emb:
-        if run['errors']:
-            st.info(f"💾 Your {n_emb} embeddings are saved below. Upload this CSV again to continue "
-                    f"without paying for them twice.")
-        try:
-            st.download_button(
-                label=f"📥 Data + Embeddings CSV ({n_emb}/{len(rdf)} pages)",
-                data=embeddings_csv(rdf, has_categories),
-                file_name=f"embeddings_{ts}.csv", mime="text/csv",
-                width="stretch", key="dl_embeddings",
-                help="Re-upload this file later to skip embedding costs")
-        except Exception as e:
-            st.error(f"❌ Could not build the embeddings file: {e}")
-
     results_df = run['results_df']
-    if results_df is None:
-        if not run['errors']:
-            st.warning(f"⚠️ No similar pairs found at or above {similarity_threshold * 100:.0f}%. "
-                       f"Try lowering the threshold.")
-        st.stop()
+    data_sheet = ('Data + Embeddings', embeddings_frame(rdf, has_categories))
 
-    level_counts = results_df['Similarity Level'].value_counts()
     summary_rows = [
         ('Total URLs Analyzed', len(rdf)),
         ('URLs With Embeddings', n_emb),
         ('New Embeddings Generated', run['new_embeddings']),
-        ('Similar Pairs Found', len(results_df)),
-    ] + [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER] + [
-        ('Average Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].mean())),
-        ('Maximum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].max())),
-        ('Minimum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].min())),
+    ]
+    if results_df is not None:
+        level_counts = results_df['Similarity Level'].value_counts()
+        summary_rows += [('Similar Pairs Found', len(results_df))] + \
+            [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER] + [
+            ('Average Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].mean())),
+            ('Maximum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].max())),
+            ('Minimum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].min())),
+        ]
+    summary_rows += [
         ('Similarity Threshold Used', f"{run['settings']['threshold'] * 100:.0f}%"),
         ('TF-IDF Analysis Included', 'Yes' if run['settings']['tfidf'] else 'No'),
     ]
+    summary_sheet = ('Summary', pd.DataFrame(summary_rows, columns=['Metric', 'Value']).astype(str))
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button("📥 Similarity Results CSV", data=results_csv(results_df),
-                           file_name=f"similarity_results_{ts}.csv", mime="text/csv",
-                           width="stretch", key="dl_results")
-    with c2:
-        st.download_button("📥 Summary CSV", data=summary_csv(summary_rows),
-                           file_name=f"similarity_summary_{ts}.csv", mime="text/csv",
-                           width="stretch", key="dl_summary")
+    # One Excel file with every sheet. Embeddings are always included – the user paid for them.
+    st.header("⬇️ Download")
+    if run['errors'] and n_emb:
+        st.info(f"💾 Your {n_emb} embeddings are saved in the file below. Upload it again to continue "
+                f"without paying for them twice.")
+
+    sheets = ([('Similarity Results', results_frame(results_df))] if results_df is not None else []) + \
+        [summary_sheet, data_sheet]
+    excel_ok = False
+    if n_emb or results_df is not None:
+        try:
+            label = "📥 Download Results (Excel)" if results_df is not None else \
+                f"📥 Download Embeddings (Excel, {n_emb}/{len(rdf)} pages)"
+            st.download_button(
+                label=label, data=excel_workbook(sheets),
+                file_name=f"semantic_similarity_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary", width="stretch", key="dl_excel",
+                help="One file: " + ", ".join(name for name, _ in sheets) + ". "
+                     "Re-upload it later to reuse the embeddings.")
+            st.caption("Sheets: " + " · ".join(name for name, _ in sheets))
+            excel_ok = True
+        except Exception as e:
+            st.warning(f"⚠️ Could not build the Excel file ({e}) – download the CSV files below instead.")
+
+    # CSV versions: tucked away normally, shown openly if Excel failed
+    with st.expander("Prefer CSV files?", expanded=not excel_ok):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if n_emb:
+                st.download_button(f"Data + Embeddings CSV", data=embeddings_csv(rdf, has_categories),
+                                   file_name=f"embeddings_{ts}.csv", mime="text/csv",
+                                   width="stretch", key="dl_embeddings")
+        if results_df is not None:
+            with c2:
+                st.download_button("Similarity Results CSV", data=results_csv(results_df),
+                                   file_name=f"similarity_results_{ts}.csv", mime="text/csv",
+                                   width="stretch", key="dl_results")
+            with c3:
+                st.download_button("Summary CSV", data=summary_csv(summary_rows),
+                                   file_name=f"similarity_summary_{ts}.csv", mime="text/csv",
+                                   width="stretch", key="dl_summary")
+
+    if results_df is None:
+        if not run['errors']:
+            st.warning(f"⚠️ No similar pairs found at or above {run['settings']['threshold'] * 100:.0f}%. "
+                       f"Try lowering the threshold.")
+        st.stop()
 
     st.header("📊 Analysis Results")
     shown_levels = [l for l in LEVEL_ORDER if level_counts.get(l, 0) > 0]

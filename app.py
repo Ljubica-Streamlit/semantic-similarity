@@ -253,10 +253,6 @@ if cut_by_excel:
 with st.expander("📋 Preview Data (first 5 rows)"):
     st.dataframe(df.drop(columns=['Embedding', 'Clean Content']).head())
 
-if missing_count and not api_key:
-    st.info("👆 Please enter your OpenAI API key in the sidebar to continue")
-    st.stop()
-
 if bp_stats['applied']:
     st.subheader("🧹 Repeated blocks")
     c1, c2, c3 = st.columns(3)
@@ -284,10 +280,17 @@ elif strip_boilerplate:
 st.header("💰 Cost Estimation")
 c1, c2 = st.columns(2)
 missing_texts = [t for t, e in zip(clean_texts, df['Embedding']) if not isinstance(e, np.ndarray)]
+cost = estimate_cost(missing_texts) if missing_count else 0.0
 c1.metric("Estimated OpenAI Cost",
-          "$0.00 (Using existing embeddings)" if missing_count == 0 else f"${estimate_cost(missing_texts):.4f}")
+          "$0.00 (Using existing embeddings)" if missing_count == 0
+          else "< $0.0001" if cost < 0.0001 else f"${cost:.4f}")
 c2.metric("Total Comparisons", f"{(len(df) * (len(df) - 1)) // 2:,}")
 st.markdown("---")
+
+# Shown after the cost, so people see the price before deciding to enter a key
+if missing_count and not api_key:
+    st.info("👆 Please enter your OpenAI API key in the sidebar to continue")
+    st.stop()
 
 
 # ---------------------------------------------------------------- analysis

@@ -3,48 +3,67 @@ import numpy as np
 from openai import OpenAI
 
 MODEL = "text-embedding-3-small"
-MAX_CHARS = 8000
+MODEL_TOKEN_LIMIT = 8191          # text-embedding-3 models
+MAX_TOKENS = 8000                 # leave a little headroom
+CHARS_PER_TOKEN = 3.5             # conservative fallback when tiktoken is unavailable
 BATCH_SIZE = 50
 MAX_RETRIES = 3
 
+try:  # exact token counting when available
+    import tiktoken
+    _ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:  # pragma: no cover - optional dependency
+    _ENC = None
 
-def estimate_cost(df, rows_to_embed=None):
-    """Rough OpenAI cost estimate (text-embedding-3-small: $0.02 per 1M tokens)."""
-    n = len(df) if rows_to_embed is None else rows_to_embed
-    avg_tokens = 1000
-    return (n * avg_tokens / 1_000_000) * 0.02
+
+def trim_to_limit(text, max_tokens=MAX_TOKENS):
+    """Cut text to the model's input limit. Returns (text, was_trimmed)."""
+    text = str(text)
+    if _ENC is not None:
+        tokens = _ENC.encode(text, disallowed_special=())
+        if len(tokens) <= max_tokens:
+            return text, False
+        return _ENC.decode(tokens[:max_tokens]), True
+    limit = int(max_tokens * CHARS_PER_TOKEN)
+    if len(text) <= limit:
+        return text, False
+    return text[:limit], True
 
 
-def _prepare_text(content):
-    text = str(content)[:MAX_CHARS].strip()
-    return f"page content: {text}" if text else "page content: (empty)"
+def estimate_cost(texts, model=MODEL):
+    """Rough OpenAI cost estimate from the actual text length."""
+    if _ENC is not None:
+        tokens = sum(min(len(_ENC.encode(str(t), disallowed_special=())), MAX_TOKENS) for t in texts)
+    else:
+        tokens = sum(min(len(str(t)) // CHARS_PER_TOKEN, MAX_TOKENS) for t in texts)
+    price = 0.13 if 'large' in model else 0.02  # per 1M tokens
+    return tokens / 1_000_000 * price
 
 
 def _is_fatal(error_str):
-    """Errors that retrying will not fix."""
     s = error_str.lower()
     return any(k in s for k in ('insufficient_quota', 'invalid_api_key', 'incorrect api key', 'account_deactivated'))
 
 
-def generate_embeddings(df, api_key, progress_callback=None, existing=None):
-    """Generate embeddings for every row that does not already have one.
+def generate_embeddings(texts, urls, api_key, progress_callback=None, existing=None, model=MODEL):
+    """Embed every text that does not already have an embedding.
 
-    Always returns a list aligned with df rows (np.ndarray or None), even when
-    it stops early, so embeddings that were paid for are never lost.
-
-    Returns dict:
-        embeddings   – list aligned with df (None where missing)
-        skipped_rows – rows that failed after retries
-        error        – fatal error message or None
-        new_count    – how many embeddings were generated in this run
+    Always returns a list aligned with `texts` (np.ndarray or None), even when it
+    stops early, so embeddings that were paid for are never lost.
     """
-    n = len(df)
+    n = len(texts)
     embeddings = list(existing) if existing is not None else [None] * n
     todo = [i for i in range(n) if not (isinstance(embeddings[i], np.ndarray) and embeddings[i].size > 0)]
-    urls = df['URL'].astype(str).tolist()
-    texts = [_prepare_text(c) for c in df['Content'].tolist()]
     skipped_rows = []
     new_count = 0
+    trimmed = 0
+
+    prepared = []
+    for t in texts:
+        text = str(t).strip() or "(empty page)"
+        text, was_trimmed = trim_to_limit(text)
+        trimmed += int(was_trimmed)
+        prepared.append(f"page content: {text}")
 
     def report(done):
         if progress_callback:
@@ -52,15 +71,16 @@ def generate_embeddings(df, api_key, progress_callback=None, existing=None):
             progress_callback(done, len(todo), min(done / total, 1.0))
 
     try:
-        client = OpenAI(api_key=api_key, max_retries=2, timeout=60)
+        client = OpenAI(api_key=api_key, max_retries=2, timeout=90)
     except Exception as e:
-        return {'embeddings': embeddings, 'skipped_rows': [], 'error': f"Could not create OpenAI client: {e}", 'new_count': 0}
+        return {'embeddings': embeddings, 'skipped_rows': [], 'error': f"Could not create OpenAI client: {e}",
+                'new_count': 0, 'trimmed': trimmed, 'model': model}
 
     def call_api(batch_texts):
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
-                resp = client.embeddings.create(model=MODEL, input=batch_texts)
+                resp = client.embeddings.create(model=model, input=batch_texts)
                 return [np.array(d.embedding, dtype=np.float32) for d in sorted(resp.data, key=lambda d: d.index)], None
             except Exception as e:
                 last_error = e
@@ -74,16 +94,18 @@ def generate_embeddings(df, api_key, progress_callback=None, existing=None):
     try:
         for start in range(0, len(todo), BATCH_SIZE):
             batch_idx = todo[start:start + BATCH_SIZE]
-            vectors, err = call_api([texts[i] for i in batch_idx])
+            vectors, err = call_api([prepared[i] for i in batch_idx])
 
             if vectors is not None:
                 for i, v in zip(batch_idx, vectors):
                     embeddings[i] = v
                     new_count += 1
             else:
-                # Batch failed – try rows one by one so one bad page doesn't sink the rest
                 for i in batch_idx:
-                    single, single_err = call_api([texts[i]])
+                    single, single_err = call_api([prepared[i]])
+                    if single is None and 'maximum context length' in str(single_err).lower():
+                        # token estimate was too generous – halve the text and try once more
+                        single, single_err = call_api([prepared[i][:len(prepared[i]) // 2]])
                     if single is not None:
                         embeddings[i] = single[0]
                         new_count += 1
@@ -99,6 +121,8 @@ def generate_embeddings(df, api_key, progress_callback=None, existing=None):
         elif 'api_key' in msg.lower() or 'incorrect api key' in msg.lower():
             msg = "OpenAI rejected the API key. Please check it and try again."
         return {'embeddings': embeddings, 'skipped_rows': skipped_rows,
-                'error': f"{msg} (stopped after {done}/{len(todo)} pages)", 'new_count': new_count}
+                'error': f"{msg} (stopped after {done}/{len(todo)} pages)", 'new_count': new_count,
+                'trimmed': trimmed, 'model': model}
 
-    return {'embeddings': embeddings, 'skipped_rows': skipped_rows, 'error': None, 'new_count': new_count}
+    return {'embeddings': embeddings, 'skipped_rows': skipped_rows, 'error': None,
+            'new_count': new_count, 'trimmed': trimmed, 'model': model}

@@ -8,11 +8,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from utils.embeddings import generate_embeddings, estimate_cost
+from utils.embeddings import generate_embeddings, estimate_cost, MODEL, MAX_TOKENS
 from utils.similarity import (
-    calculate_similarities, calculate_cosine_similarity, categorize_similarity,
-    SIMILARITY_LEVELS, LEVEL_ORDER,
+    calculate_similarities, calculate_cosine_similarity, categorize_similarity, classify_overlap,
+    SIMILARITY_LEVELS, LEVEL_ORDER, TEMPLATE_TWIN_MIN, THIN_PAGE_MAX_UNIQUE_PCT, MAX_TEMPLATE_TWIN_PAIRS,
 )
+from utils import boilerplate
 from utils.tfidf import calculate_tfidf_for_pairs, calculate_tfidf_similarity
 from utils.export import embeddings_csv, results_csv, summary_csv, excel_workbook, embeddings_frame, results_frame
 from utils.columns import load_table, detect_columns, column_labels, build_dataframe
@@ -61,22 +62,19 @@ with st.sidebar:
     st.markdown("---")
     st.header("📊 Analysis Options")
 
-    include_tfidf = st.checkbox("Include TF-IDF Analysis", value=False,
-                                help="Calculate keyword overlap for semantic similarity results.")
-    show_tfidf_only_matches = False
-    if include_tfidf:
-        show_tfidf_only_matches = st.checkbox(
-            "Show Additional TF-IDF Matches", value=False,
-            help="Also show pairs with high keyword overlap (TF-IDF) but lower semantic similarity.")
-
     similarity_threshold = st.slider(
         "Semantic Similarity Threshold (%)", min_value=70, max_value=99, value=85, step=1,
-        help="Only show pairs with semantic similarity at or above this value") / 100
+        help="Only show pairs whose unique content is at least this similar") / 100
 
-    tfidf_threshold = similarity_threshold
-    if include_tfidf and show_tfidf_only_matches:
-        tfidf_threshold = st.slider("TF-IDF Similarity Threshold (%)", min_value=30, max_value=95,
-                                    value=85, step=5) / 100
+    strip_boilerplate = st.checkbox(
+        "Remove repeated blocks before comparing", value=True,
+        help="Nav, footer, cookie banners and CTAs that appear on most pages are left out of the "
+             "comparison, so scores reflect the unique content. Your file is never changed.")
+    boilerplate_threshold = boilerplate.DEFAULT_THRESHOLD
+    if strip_boilerplate:
+        boilerplate_threshold = st.slider(
+            "Remove blocks found on at least (% of pages)", min_value=50, max_value=100, value=80, step=5,
+            help="Lower this to also remove blocks shared by one section only (e.g. all case studies).") / 100
 
     st.markdown("---")
     st.header("🎯 Similarity Levels")
@@ -158,7 +156,8 @@ if url_col == content_col:
     st.error("❌ URL and Content can't be the same column – open **Change columns** above to fix it.")
     st.stop()
 
-mapping = dict(header_row=header_row, url=url_col, content=content_col, category=cat_col, embedding=emb_col)
+mapping = dict(header_row=header_row, url=url_col, content=content_col, category=cat_col,
+               embedding=emb_col, settings=detected.get('settings'))
 df, row_stats = build_dataframe(raw, mapping)
 labels = column_labels(raw, header_row)
 
@@ -213,14 +212,56 @@ if missing_count and not api_key:
     st.info("👆 Please enter your OpenAI API key in the sidebar to continue")
     st.stop()
 
-# ---------------------------------------------------------------- cost
+# ---------------------------------------------------------------- repeated blocks
+raw_texts = df['Content'].tolist()
+if strip_boilerplate:
+    clean_texts, bp_stats = boilerplate.analyse(raw_texts, threshold=boilerplate_threshold)
+else:
+    clean_texts, bp_stats = list(raw_texts), {'applied': False, 'reason': 'Switched off.', 'heavy': False,
+                                              'unique_pct': [100.0] * len(df)}
+df['Clean Content'] = clean_texts
+df['Unique Content %'] = bp_stats.get('unique_pct', [100.0] * len(df))
+
+if bp_stats['applied']:
+    st.subheader("🧹 Repeated blocks")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Blocks removed", bp_stats['removed_block_count'])
+    c2.metric("Characters removed per page", f"{bp_stats['removed_chars_avg']:,}")
+    c3.metric("Unique content left", f"{bp_stats['avg_unique_pct']}%")
+    with st.expander("See what is being removed"):
+        st.dataframe(pd.DataFrame([{'On % of pages': b['share'], 'Text': b['text']}
+                                   for b in bp_stats['removed_blocks']]),
+                     hide_index=True, width="stretch")
+        st.caption("Only the text sent for comparison changes – your file and the exported content stay complete.")
+    if bp_stats['heavy']:
+        st.warning(f"⚠️ The repeated blocks make up {100 - bp_stats['avg_unique_pct']:.0f}% of the average page. "
+                   f"These pages may be template variants (e.g. location or product pages) whose shared text is "
+                   f"the finding itself. You can continue – pairs that match mainly through shared blocks are "
+                   f"labelled **Template twins** – or raise the threshold / switch removal off in the sidebar.")
+    if bp_stats.get('empty_pages'):
+        st.caption(f"ℹ️ {bp_stats['empty_pages']} pages have almost nothing left after removal and are flagged "
+                   f"as mostly shared template.")
+elif strip_boilerplate:
+    st.caption(f"🧹 Repeated-block removal not applied: {bp_stats['reason']}")
+
+# ---------------------------------------------------------------- settings / cost
+settings_label = (f"model={MODEL}; boilerplate="
+                  f"{('on@' + str(int(boilerplate_threshold * 100)) + '%') if bp_stats['applied'] else 'off'}; "
+                  f"max_tokens={MAX_TOKENS}")
+if 'Embedding Settings' in df.columns and existing_count:
+    previous = {str(v) for v in df['Embedding Settings'].dropna().unique() if str(v).strip()}
+    mismatched = {p for p in previous if p != settings_label}
+    if mismatched:
+        st.warning("⚠️ The embeddings in this file were made with different settings "
+                   f"({'; '.join(sorted(mismatched))}). They are not comparable with new ones. "
+                   "Either match the settings in the sidebar, or remove the Embedding column to regenerate them.")
+
 st.header("💰 Cost Estimation")
 c1, c2 = st.columns(2)
+missing_texts = [t for t, e in zip(clean_texts, df['Embedding']) if not isinstance(e, np.ndarray)]
 c1.metric("Estimated OpenAI Cost",
-          "$0.00 (Using existing embeddings)" if missing_count == 0 else f"${estimate_cost(df, missing_count):.4f}")
+          "$0.00 (Using existing embeddings)" if missing_count == 0 else f"${estimate_cost(missing_texts):.4f}")
 c2.metric("Total Comparisons", f"{(len(df) * (len(df) - 1)) // 2:,}")
-if include_tfidf:
-    st.info("✅ TF-IDF analysis is free (no API costs)")
 st.markdown("---")
 
 
@@ -229,17 +270,24 @@ def run_analysis(df):
     """Runs every step. Stores progress in session_state so nothing paid for is lost."""
     run = {'df': df, 'results_df': None, 'errors': [], 'warnings': [], 'new_embeddings': 0,
            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-           'settings': dict(threshold=similarity_threshold, tfidf=include_tfidf)}
+           'settings': dict(threshold=similarity_threshold, boilerplate=bp_stats['applied'],
+                            boilerplate_threshold=boilerplate_threshold, label=settings_label),
+           'boilerplate': bp_stats}
     st.session_state['run'] = run
 
-    # Step 1 – embeddings
+    # Step 1 – embeddings (built from the text with repeated blocks removed)
     if missing_count:
         progress = st.progress(0.0, text="Step 1/3: Generating AI embeddings...")
         emb = generate_embeddings(
-            df, api_key, existing=df['Embedding'].tolist(),
+            df['Clean Content'].tolist(), df['URL'].astype(str).tolist(), api_key,
+            existing=df['Embedding'].tolist(),
             progress_callback=lambda done, total, p: progress.progress(p, text=f"Step 1/3: Embedding {done}/{total} pages..."))
         df['Embedding'] = emb['embeddings']
+        df['Embedding Settings'] = settings_label
         run['new_embeddings'] = emb['new_count']
+        if emb.get('trimmed'):
+            run['warnings'].append(f"{emb['trimmed']} pages were longer than the model's limit and were trimmed "
+                                   f"to their first ~{MAX_TOKENS:,} tokens.")
         if emb['skipped_rows']:
             run['warnings'].append(
                 f"{len(emb['skipped_rows'])} pages could not be embedded and were left out: " +
@@ -251,9 +299,9 @@ def run_analysis(df):
     else:
         st.info("⏭️ Step 1/3: Using existing embeddings – skipped generation")
 
-    # Step 2 – semantic similarity
+    # Step 2 – unique-content similarity
     try:
-        progress = st.progress(0.0, text="Step 2/3: Calculating semantic similarities...")
+        progress = st.progress(0.0, text="Step 2/3: Comparing unique content...")
         results = calculate_similarities(
             df, threshold=similarity_threshold,
             progress_callback=lambda cur, tot: progress.progress(min(cur / tot, 1.0), text=f"Step 2/3: Compared {cur}/{tot} pages..."))
@@ -262,39 +310,54 @@ def run_analysis(df):
         run['trace'] = traceback.format_exc()
         return
 
-    # Step 3 – TF-IDF (optional; failure here never discards semantic results)
-    if include_tfidf and results:
-        try:
-            progress = st.progress(0.0, text="Step 3/3: Calculating TF-IDF...")
-            pairs = [(r['URL 1'], r['URL 2']) for r in results]
-            scores = calculate_tfidf_for_pairs(
-                df, pairs,
-                progress_callback=lambda cur, tot: progress.progress(min(cur / tot, 1.0), text=f"Step 3/3: TF-IDF {cur}/{tot} pairs..."))
-            for r in results:
-                r['TF-IDF Similarity'] = scores.get(tuple(sorted([r['URL 1'], r['URL 2']])), 0.0)
+    # Step 3 – full-page overlap on the raw text (free, no API)
+    raw_df = df.rename(columns={'Content': 'Content'})
+    try:
+        progress = st.progress(0.0, text="Step 3/3: Measuring full-page overlap...")
+        pairs = [(r['URL 1'], r['URL 2']) for r in results]
+        overlap = calculate_tfidf_for_pairs(raw_df, pairs, filter_common=False) if pairs else {}
+        for r in results:
+            r['Full-page Overlap'] = overlap.get(tuple(sorted([r['URL 1'], r['URL 2']])), 0.0)
 
-            if show_tfidf_only_matches:
-                existing_pairs = set(scores.keys())
-                emb_by_url = {}
-                for u, e in zip(df['URL'], df['Embedding']):
-                    emb_by_url.setdefault(u, e)
-                for t in calculate_tfidf_similarity(df, threshold=tfidf_threshold):
-                    key = tuple(sorted([t['URL 1'], t['URL 2']]))
-                    if key in existing_pairs:
-                        continue
-                    e1, e2 = emb_by_url.get(t['URL 1']), emb_by_url.get(t['URL 2'])
-                    sem = calculate_cosine_similarity(e1, e2) if (isinstance(e1, np.ndarray) and isinstance(e2, np.ndarray)) else np.nan
-                    results.append({'URL 1': t['URL 1'], 'URL 2': t['URL 2'],
-                                    'Semantic Similarity': sem, 'TF-IDF Similarity': t['TF-IDF Similarity'],
-                                    'Match Type': 'TF-IDF only'})
-        except Exception as e:
-            run['warnings'].append(f"TF-IDF analysis failed and was skipped: {e}")
+        # Pages that match mainly through shared blocks would otherwise disappear – keep them, labelled.
+        if bp_stats['applied']:
+            known = set(overlap.keys())
+            emb_by_url, thin = {}, {}
+            for u, e, pct in zip(df['URL'], df['Embedding'], df['Unique Content %']):
+                emb_by_url.setdefault(u, e)
+                thin.setdefault(u, pct < THIN_PAGE_MAX_UNIQUE_PCT)
+            extra = 0
+            for t in calculate_tfidf_similarity(raw_df, threshold=TEMPLATE_TWIN_MIN, filter_common=False):
+                key = tuple(sorted([t['URL 1'], t['URL 2']]))
+                if key in known or not (thin.get(t['URL 1']) and thin.get(t['URL 2'])):
+                    continue
+                extra += 1
+                if extra > MAX_TEMPLATE_TWIN_PAIRS:
+                    run['warnings'].append(
+                        f"More than {MAX_TEMPLATE_TWIN_PAIRS:,} template-twin pairs were found – only the "
+                        f"first {MAX_TEMPLATE_TWIN_PAIRS:,} are listed.")
+                    break
+                e1, e2 = emb_by_url.get(t['URL 1']), emb_by_url.get(t['URL 2'])
+                sem = (calculate_cosine_similarity(e1, e2)
+                       if isinstance(e1, np.ndarray) and isinstance(e2, np.ndarray) else np.nan)
+                results.append({'URL 1': t['URL 1'], 'URL 2': t['URL 2'], 'Semantic Similarity': sem,
+                                'Full-page Overlap': t['TF-IDF Similarity']})
+        progress.progress(1.0, text="Step 3/3: Full-page overlap done")
+    except Exception as e:
+        run['warnings'].append(f"Full-page overlap could not be calculated: {e}")
 
     if results:
         results_df = pd.DataFrame(results)
-        results_df.insert(2, 'Similarity Level',
-                          results_df['Semantic Similarity'].apply(lambda s: categorize_similarity(s) if pd.notna(s) else '–'))
-        run['results_df'] = results_df
+        unique_pct = dict(zip(df['URL'].astype(str), df['Unique Content %']))
+        results_df.insert(2, 'Similarity Level', results_df['Semantic Similarity'].apply(
+            lambda s: categorize_similarity(s) if pd.notna(s) else '–'))
+        results_df.insert(3, 'Overlap Type', [
+            classify_overlap(r['Semantic Similarity'], r.get('Full-page Overlap'), similarity_threshold)
+            for _, r in results_df.iterrows()])
+        results_df['Unique Content % 1'] = results_df['URL 1'].map(unique_pct)
+        results_df['Unique Content % 2'] = results_df['URL 2'].map(unique_pct)
+        results_df = results_df.sort_values('Semantic Similarity', ascending=False, na_position='last')
+        run['results_df'] = results_df.reset_index(drop=True)
 
 
 if st.button("🚀 Start Analysis", type="primary", width="stretch"):
@@ -303,7 +366,9 @@ if st.button("🚀 Start Analysis", type="primary", width="stretch"):
     except Exception as e:
         run = st.session_state.setdefault('run', {'df': df, 'results_df': None, 'errors': [], 'warnings': [],
                                                    'new_embeddings': 0, 'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                                                   'settings': dict(threshold=similarity_threshold, tfidf=include_tfidf)})
+                                                   'settings': dict(threshold=similarity_threshold, boilerplate=bp_stats['applied'],
+                                                                    boilerplate_threshold=boilerplate_threshold,
+                                                                    label=settings_label)})
         run['errors'].append(f"Unexpected error: {e}")
         run['trace'] = traceback.format_exc()
 
@@ -341,8 +406,12 @@ if run:
         ]
     summary_rows += [
         ('Similarity Threshold Used', f"{run['settings']['threshold'] * 100:.0f}%"),
-        ('TF-IDF Analysis Included', 'Yes' if run['settings']['tfidf'] else 'No'),
-    ]
+        ('Repeated Blocks Removed', 'Yes' if run['settings']['boilerplate'] else 'No'),
+        ('Removal Threshold', f"{run['settings']['boilerplate_threshold'] * 100:.0f}% of pages"
+         if run['settings']['boilerplate'] else 'n/a'),
+        ('Embedding Settings', run['settings']['label']),
+    ] + ([(f"Overlap type: {k}", int(v)) for k, v in results_df['Overlap Type'].value_counts().items()]
+         if results_df is not None and 'Overlap Type' in results_df.columns else [])
     summary_sheet = ('Summary', pd.DataFrame(summary_rows, columns=['Metric', 'Value']).astype(str))
 
     # One Excel file with every sheet. Embeddings are always included – the user paid for them.
@@ -401,15 +470,26 @@ if run:
         col.metric(label, int(level_counts[label]))
     cols[-1].metric("Avg Similarity", fmt_pct(results_df['Semantic Similarity'].mean()))
 
+    if 'Overlap Type' in results_df.columns:
+        st.subheader("🧩 What kind of overlap")
+        type_counts = results_df['Overlap Type'].value_counts()
+        tcols = st.columns(max(len(type_counts), 1))
+        for col, (label, count) in zip(tcols, type_counts.items()):
+            col.metric(label, int(count))
+        st.caption("**Same content** – the unique text matches too. "
+                   "**Same topic, different wording** – same subject, written differently. "
+                   "**Template twins** – the pages match mainly through blocks they share.")
+
     st.subheader("📈 Similarity Level Distribution")
     dist = pd.DataFrame({'Pairs': [int(level_counts.get(l, 0)) for l in LEVEL_ORDER]}, index=LEVEL_ORDER)
     st.bar_chart(dist[dist['Pairs'] > 0])
 
     st.subheader("🔝 Top 10 Most Similar Pairs")
+    st.caption("\"Semantic Similarity\" compares the unique content; \"Full-page Overlap\" compares the raw text.")
     display_df = results_df.head(10).copy()
     display_df['Semantic Similarity'] = display_df['Semantic Similarity'].apply(fmt_pct)
-    if 'TF-IDF Similarity' in display_df.columns:
-        display_df['TF-IDF Similarity'] = display_df['TF-IDF Similarity'].apply(fmt_pct)
+    if 'Full-page Overlap' in display_df.columns:
+        display_df['Full-page Overlap'] = display_df['Full-page Overlap'].apply(fmt_pct)
     st.dataframe(display_df, width="stretch", hide_index=True)
 
     st.success("✅ Analysis complete! Download your results above.")

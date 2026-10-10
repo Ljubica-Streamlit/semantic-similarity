@@ -5,7 +5,9 @@ A Streamlit app that measures semantic similarity between web pages using AI emb
 ## Features
 
 - 🔍 **AI-Powered Analysis** - Uses OpenAI embeddings for semantic similarity
-- 📊 **TF-IDF Support** - Optional keyword overlap analysis
+- 🧹 **Repeated blocks removed** - Nav, footer, cookie banners and CTAs are left out of the comparison
+- 🧩 **Two scores per pair** - unique-content similarity *and* full-page overlap, so template twins are visible
+
 - 🎯 **Similarity Levels** - Duplicate, Near-duplicate, Very similar, Similar, Related, Loosely related
 - 📈 **Progress Tracking** - Real-time progress bars
 - 💰 **Cost Estimation** - Know the cost before running
@@ -51,6 +53,16 @@ One Excel file (`semantic_similarity_<date>.xlsx`) with three sheets:
 If the analysis stops early (e.g. OpenAI quota), the file still contains every embedding generated so far.
 The same data is available as separate CSV files under *Prefer CSV files?*.
 
+### Overlap Types
+
+Each pair also gets an overlap type, combining the two scores:
+
+| Type | Meaning |
+|---|---|
+| Same content | The unique text matches too – a real duplicate |
+| Same topic, different wording | Same subject, written differently |
+| Template twins (shared blocks) | The pages match mainly through blocks they share (e.g. location or product templates) |
+
 ### Similarity Levels
 
 | Level | Semantic similarity |
@@ -61,6 +73,19 @@ The same data is available as separate CSV files under *Prefer CSV files?*.
 | 🟡 Similar | 90–95% |
 | 🟢 Related | 85–90% |
 | ⚪ Loosely related | below 85% |
+
+## How the comparison works
+
+1. **Repeated blocks are removed** (on by default). A block of text that appears on at least 80% of the
+   uploaded pages is left out before embedding, so scores reflect what makes each page different.
+   Needs at least 10 pages; the threshold is adjustable (50–100%); your file is never changed.
+   If the removal leaves little behind, the app says so and labels those pages as mostly shared template.
+2. **Unique-content similarity** – OpenAI embeddings of the cleaned text, up to the model's full input
+   limit (~8,000 tokens per page; longer pages are trimmed and reported).
+3. **Full-page overlap** – word overlap on the original, untouched text. Free, no API calls.
+
+Embeddings are tagged with the settings used (model, removal threshold, token cap). Re-uploading a file
+whose embeddings were made with different settings produces a warning, because the scores are not comparable.
 
 ## Cost
 

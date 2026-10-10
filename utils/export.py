@@ -31,20 +31,17 @@ def to_csv_bytes(df):
 
 def embeddings_csv(df, has_categories):
     """URL, Content, (Category), Embedding – can be re-uploaded to skip API costs."""
-    out = pd.DataFrame({'URL': df['URL'], 'Content': df['Content']})
-    if has_categories:
-        out['Category'] = df['Category']
-    out['Embedding'] = df['Embedding'].apply(embedding_to_str)
-    return to_csv_bytes(out)
+    return to_csv_bytes(embeddings_frame(df, has_categories))
 
 
 def results_csv(results_df):
     out = results_df.copy()
-    for col in ('Semantic Similarity', 'TF-IDF Similarity'):
+    for col in ('Semantic Similarity', 'TF-IDF Similarity', 'Full-page Overlap'):
         if col in out.columns:
             out[col] = (out[col].astype(float) * 100).round(2)
     out = out.rename(columns={'Semantic Similarity': 'Semantic Similarity (%)',
-                              'TF-IDF Similarity': 'TF-IDF Similarity (%)'})
+                              'TF-IDF Similarity': 'TF-IDF Similarity (%)',
+                              'Full-page Overlap': 'Full-page Overlap (%)'})
     return to_csv_bytes(out)
 
 
@@ -68,7 +65,11 @@ def embeddings_frame(df, has_categories):
     out = pd.DataFrame({'URL': df['URL'], 'Content': df['Content']})
     if has_categories:
         out['Category'] = df['Category']
+    if 'Unique Content %' in df.columns:
+        out['Unique Content %'] = df['Unique Content %']
     out['Embedding'] = df['Embedding'].apply(embedding_to_str)
+    if 'Embedding Settings' in df.columns:
+        out['Embedding Settings'] = df['Embedding Settings']
     return out
 
 

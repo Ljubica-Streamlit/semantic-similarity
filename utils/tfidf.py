@@ -2,14 +2,16 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-def _build_matrix(texts):
+def _build_matrix(texts, filter_common=True):
     """Fit TF-IDF safely for any number of documents.
 
     min_df=2 / max_df=0.8 raise errors on small files (e.g. 2-4 pages) or when
     no words survive filtering, so relax them for small inputs.
     """
     n = len(texts)
-    if n >= 10:
+    if not filter_common:
+        params = dict(min_df=1, max_df=1.0)
+    elif n >= 10:
         params = dict(min_df=2, max_df=0.8)
     else:
         params = dict(min_df=1, max_df=1.0)
@@ -27,7 +29,7 @@ def _build_matrix(texts):
         return vectorizer.fit_transform(texts)
 
 
-def calculate_tfidf_for_pairs(df, url_pairs, progress_callback=None):
+def calculate_tfidf_for_pairs(df, url_pairs, progress_callback=None, filter_common=True):
     """TF-IDF similarity for specific URL pairs only."""
     texts = df['Content'].fillna('').astype(str).tolist()
     urls = df['URL'].astype(str).tolist()
@@ -35,7 +37,7 @@ def calculate_tfidf_for_pairs(df, url_pairs, progress_callback=None):
     for idx, url in enumerate(urls):
         url_to_idx.setdefault(url, idx)  # first occurrence wins for duplicate URLs
 
-    tfidf_matrix = _build_matrix(texts)
+    tfidf_matrix = _build_matrix(texts, filter_common)
 
     results = {}
     total_pairs = len(url_pairs)
@@ -52,11 +54,11 @@ def calculate_tfidf_for_pairs(df, url_pairs, progress_callback=None):
     return results
 
 
-def calculate_tfidf_similarity(df, threshold=0.5, progress_callback=None):
+def calculate_tfidf_similarity(df, threshold=0.5, progress_callback=None, filter_common=True):
     """TF-IDF similarity for all pairs above threshold."""
     texts = df['Content'].fillna('').astype(str).tolist()
     urls = df['URL'].astype(str).tolist()
-    tfidf_matrix = _build_matrix(texts)
+    tfidf_matrix = _build_matrix(texts, filter_common)
 
     results = []
     n = len(texts)

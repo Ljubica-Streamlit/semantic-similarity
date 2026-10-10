@@ -86,3 +86,22 @@ def calculate_similarities(df, threshold=0.85, progress_callback=None, block_siz
 
     results.sort(key=lambda r: r['Semantic Similarity'], reverse=True)
     return results
+
+
+# --------------------------------------------------------------- overlap types
+FULL_OVERLAP_HIGH = 0.70     # raw-text word overlap counted as "same words"
+TEMPLATE_TWIN_MIN = 0.80     # raw overlap that makes a pair worth showing on its own
+THIN_PAGE_MAX_UNIQUE_PCT = 40  # below this a page is mostly shared template
+MAX_TEMPLATE_TWIN_PAIRS = 5000
+
+
+def classify_overlap(unique_sim, full_overlap, threshold):
+    """Combine unique-content similarity with full-page overlap into one label."""
+    import math
+    has_unique = unique_sim is not None and not (isinstance(unique_sim, float) and math.isnan(unique_sim))
+    full = 0.0 if full_overlap is None else float(full_overlap)
+    if has_unique and unique_sim >= threshold:
+        return 'Same content' if full >= FULL_OVERLAP_HIGH else 'Same topic, different wording'
+    if full >= TEMPLATE_TWIN_MIN:
+        return 'Template twins (shared blocks)'
+    return 'Related'

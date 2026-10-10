@@ -16,6 +16,7 @@ CONTENT_NAMES = {'content', 'contents', 'text', 'body', 'body text', 'page text'
                  'copy', 'html text', 'article', 'description', 'extracted text', 'content 1', 'extractor 1 1'}
 CATEGORY_NAMES = {'category', 'categories', 'type', 'page type', 'section', 'cluster', 'group', 'topic',
                   'template', 'segment', 'folder'}
+SETTINGS_NAMES = {'embedding settings', 'settings'}
 EMBED_NAMES = {'embedding', 'embeddings', 'ai embedding', 'vector', 'vectors'}
 
 MAX_HEADER_SCAN = 5
@@ -172,8 +173,10 @@ def detect_columns(raw):
                  and prof[c]['url'] < 0.2 and prof[c]['numeric'] < 0.5 and prof[c]['unique'] < 0.6]
         category_col = cands[0] if cands else None
 
+    settings_col = by_name(SETTINGS_NAMES, used | {category_col})
+
     return dict(header_row=header_row, url=url_col, content=content_col,
-                category=category_col, embedding=embed_col)
+                category=category_col, embedding=embed_col, settings=settings_col)
 
 
 def column_labels(raw, header_row):
@@ -201,6 +204,8 @@ def build_dataframe(raw, mapping):
         df['Category'] = data[mapping['category']].replace('', pd.NA)
     if mapping.get('embedding') is not None:
         df['Embedding'] = data[mapping['embedding']].replace('', pd.NA)
+    if mapping.get('settings') is not None:
+        df['Embedding Settings'] = data[mapping['settings']]
 
     total = len(df)
     no_url = df['URL'].str.strip() == ''

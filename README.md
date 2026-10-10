@@ -108,6 +108,10 @@ whose embeddings were made with different settings produces a warning, because t
 
 For issues or questions, create an issue on GitHub.
 
+## Author
+
+Built by [Ljubica Popovic](https://www.linkedin.com/in/ljubica-popovic-lp/).
+
 ## License
 
-MIT License
+MIT License – see [LICENSE](LICENSE). Copyright (c) 2026 Ljubica Popovic.

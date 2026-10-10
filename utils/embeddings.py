@@ -6,7 +6,8 @@ MODEL = "text-embedding-3-small"
 MODEL_TOKEN_LIMIT = 8191          # text-embedding-3 models
 MAX_TOKENS = 8000                 # leave a little headroom
 CHARS_PER_TOKEN = 3.5             # conservative fallback when tiktoken is unavailable
-BATCH_SIZE = 50
+BATCH_SIZE = 50                   # max pages per request
+MAX_BATCH_TOKENS = 250_000        # OpenAI caps total tokens per request (~300k)
 MAX_RETRIES = 3
 
 try:  # exact token counting when available
@@ -17,17 +18,30 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 def trim_to_limit(text, max_tokens=MAX_TOKENS):
-    """Cut text to the model's input limit. Returns (text, was_trimmed)."""
+    """Cut text to the model's input limit. Returns (text, was_trimmed, token_count)."""
     text = str(text)
     if _ENC is not None:
         tokens = _ENC.encode(text, disallowed_special=())
         if len(tokens) <= max_tokens:
-            return text, False
-        return _ENC.decode(tokens[:max_tokens]), True
+            return text, False, len(tokens)
+        return _ENC.decode(tokens[:max_tokens]), True, max_tokens
     limit = int(max_tokens * CHARS_PER_TOKEN)
     if len(text) <= limit:
-        return text, False
-    return text[:limit], True
+        return text, False, int(len(text) / CHARS_PER_TOKEN) + 1
+    return text[:limit], True, max_tokens
+
+
+def _batches(todo, token_counts):
+    """Group row indexes so no request exceeds BATCH_SIZE pages or MAX_BATCH_TOKENS tokens."""
+    batch, batch_tokens = [], 0
+    for i in todo:
+        if batch and (len(batch) >= BATCH_SIZE or batch_tokens + token_counts[i] > MAX_BATCH_TOKENS):
+            yield batch
+            batch, batch_tokens = [], 0
+        batch.append(i)
+        batch_tokens += token_counts[i]
+    if batch:
+        yield batch
 
 
 def estimate_cost(texts, model=MODEL):
@@ -58,12 +72,14 @@ def generate_embeddings(texts, urls, api_key, progress_callback=None, existing=N
     new_count = 0
     trimmed = 0
 
-    prepared = []
-    for t in texts:
-        text = str(t).strip() or "(empty page)"
-        text, was_trimmed = trim_to_limit(text)
+    # Only the rows that will actually be sent
+    prepared, token_counts = {}, {}
+    for i in todo:
+        text = str(texts[i]).strip() or "(empty page)"
+        text, was_trimmed, tokens = trim_to_limit(text)
         trimmed += int(was_trimmed)
-        prepared.append(f"page content: {text}")
+        prepared[i] = f"page content: {text}"
+        token_counts[i] = tokens + 3  # the prefix
 
     def report(done):
         if progress_callback:
@@ -92,8 +108,7 @@ def generate_embeddings(texts, urls, api_key, progress_callback=None, existing=N
 
     done = 0
     try:
-        for start in range(0, len(todo), BATCH_SIZE):
-            batch_idx = todo[start:start + BATCH_SIZE]
+        for batch_idx in _batches(todo, token_counts):
             vectors, err = call_api([prepared[i] for i in batch_idx])
 
             if vectors is not None:

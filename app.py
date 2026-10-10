@@ -1,5 +1,4 @@
 import hashlib
-import io
 import json
 import traceback
 from datetime import datetime
@@ -11,11 +10,14 @@ import streamlit as st
 from utils.embeddings import generate_embeddings, estimate_cost, MODEL, MAX_TOKENS
 from utils.similarity import (
     calculate_similarities, calculate_cosine_similarity, categorize_similarity, classify_overlap,
-    SIMILARITY_LEVELS, LEVEL_ORDER, TEMPLATE_TWIN_MIN, THIN_PAGE_MAX_UNIQUE_PCT, MAX_TEMPLATE_TWIN_PAIRS,
+    SIMILARITY_LEVELS, LEVEL_ORDER, TEMPLATE_TWIN_MIN, MAX_TEMPLATE_TWIN_PAIRS,
 )
 from utils import boilerplate
-from utils.tfidf import calculate_tfidf_for_pairs, calculate_tfidf_similarity
-from utils.export import embeddings_csv, results_csv, summary_csv, excel_workbook, embeddings_frame, results_frame
+from utils.tfidf import build_matrix, calculate_tfidf_for_pairs, calculate_tfidf_similarity
+from utils.export import (
+    embeddings_csv, results_csv, summary_csv, excel_workbook, embeddings_frame, results_frame,
+    count_over_cell_limit, looks_cut_by_excel, EXCEL_CELL_LIMIT,
+)
 from utils.columns import load_table, detect_columns, column_labels, build_dataframe
 
 st.set_page_config(page_title="Semantic Similarity Analyzer", page_icon="🔍", layout="wide")
@@ -158,6 +160,13 @@ if url_col == content_col:
 
 mapping = dict(header_row=header_row, url=url_col, content=content_col, category=cat_col,
                embedding=emb_col, settings=detected.get('settings'))
+
+# Results from a run with different columns no longer describe this data
+mapping_key = (header_row, url_col, content_col, cat_col, emb_col)
+if st.session_state.get('mapping_key') != mapping_key:
+    st.session_state['mapping_key'] = mapping_key
+    st.session_state.pop('run', None)
+
 df, row_stats = build_dataframe(raw, mapping)
 labels = column_labels(raw, header_row)
 
@@ -187,31 +196,6 @@ if len(df) > 5000:
     st.error(f"❌ File too large: {len(df)} URLs found. Maximum supported: 5,000 URLs")
     st.stop()
 
-# Existing embeddings (tolerant: bad rows just become "missing")
-embedding_col = 'Embedding' if 'Embedding' in df.columns else None
-df['Embedding'] = df['Embedding'].apply(parse_embedding) if embedding_col else [None] * len(df)
-existing_count = count_valid(df['Embedding'])
-missing_count = len(df) - existing_count
-has_categories = 'Category' in df.columns and not df['Category'].isna().all()
-
-duplicate_urls = int(df['URL'].duplicated().sum())
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Pages", len(df))
-c2.metric("Existing Embeddings", f"{existing_count}/{len(df)}")
-c3.metric("Has Categories", "Yes ✅" if has_categories else "No")
-if duplicate_urls:
-    st.warning(f"⚠️ {duplicate_urls} duplicate URLs found in the file – they will be compared like separate pages.")
-if embedding_col and 0 < existing_count < len(df):
-    st.info(f"ℹ️ {missing_count} rows have no embedding – only those will be generated.")
-
-with st.expander("📋 Preview Data (first 5 rows)"):
-    st.dataframe(df.drop(columns=['Embedding']).head())
-
-if missing_count and not api_key:
-    st.info("👆 Please enter your OpenAI API key in the sidebar to continue")
-    st.stop()
-
 # ---------------------------------------------------------------- repeated blocks
 raw_texts = df['Content'].tolist()
 if strip_boilerplate:
@@ -221,6 +205,57 @@ else:
                                               'unique_pct': [100.0] * len(df)}
 df['Clean Content'] = clean_texts
 df['Unique Content %'] = bp_stats.get('unique_pct', [100.0] * len(df))
+if bp_stats['applied']:
+    df['Page Note'] = [boilerplate.thin_page_note(p, t) for p, t in zip(df['Unique Content %'], clean_texts)]
+
+settings_label = (f"model={MODEL}; boilerplate="
+                  f"{('on@' + str(int(boilerplate_threshold * 100)) + '%') if bp_stats['applied'] else 'off'}; "
+                  f"max_tokens={MAX_TOKENS}")
+
+# Existing embeddings (tolerant: bad rows just become "missing")
+embedding_col = 'Embedding' if 'Embedding' in df.columns else None
+df['Embedding'] = df['Embedding'].apply(parse_embedding) if embedding_col else [None] * len(df)
+
+# Embeddings made with other settings would give quietly wrong scores – regenerate them
+mismatched_settings, mismatched_count = set(), 0
+if 'Embedding Settings' in df.columns:
+    previous = df['Embedding Settings'].fillna('').astype(str).str.strip()
+    stale = df['Embedding'].apply(lambda e: isinstance(e, np.ndarray)) & (previous != '') & (previous != settings_label)
+    mismatched_settings = set(previous[stale])
+    mismatched_count = int(stale.sum())
+    df['Embedding'] = [None if s else e for e, s in zip(df['Embedding'], stale)]
+
+existing_count = count_valid(df['Embedding'])
+missing_count = len(df) - existing_count
+has_categories = 'Category' in df.columns and not df['Category'].isna().all()
+
+duplicate_urls = int(df['URL'].duplicated().sum())
+cut_by_excel = int(df['Content'].map(looks_cut_by_excel).sum())
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Pages", len(df))
+c2.metric("Existing Embeddings", f"{existing_count}/{len(df)}")
+c3.metric("Has Categories", "Yes ✅" if has_categories else "No")
+if duplicate_urls:
+    st.warning(f"⚠️ {duplicate_urls} duplicate URLs found in the file – they will be compared like separate pages.")
+if mismatched_count:
+    st.warning(f"⚠️ {mismatched_count} embeddings in this file were made with different settings "
+               f"({'; '.join(sorted(mismatched_settings))}) and can't be compared with the current ones "
+               f"({settings_label}). They will be generated again. To reuse them instead, match the settings "
+               f"in the sidebar.")
+elif embedding_col and 0 < existing_count < len(df):
+    st.info(f"ℹ️ {missing_count} rows have no embedding – only those will be generated.")
+if cut_by_excel:
+    st.warning(f"⚠️ {cut_by_excel} pages were cut to Excel's {EXCEL_CELL_LIMIT:,}-character cell limit in an "
+               f"earlier export. Their embeddings are fine, but Full-page Overlap is measured on the shortened "
+               f"text. Upload the *Data + Embeddings CSV* instead to keep the full content.")
+
+with st.expander("📋 Preview Data (first 5 rows)"):
+    st.dataframe(df.drop(columns=['Embedding', 'Clean Content']).head())
+
+if missing_count and not api_key:
+    st.info("👆 Please enter your OpenAI API key in the sidebar to continue")
+    st.stop()
 
 if bp_stats['applied']:
     st.subheader("🧹 Repeated blocks")
@@ -238,24 +273,14 @@ if bp_stats['applied']:
                    f"These pages may be template variants (e.g. location or product pages) whose shared text is "
                    f"the finding itself. You can continue – pairs that match mainly through shared blocks are "
                    f"labelled **Template twins** – or raise the threshold / switch removal off in the sidebar.")
-    if bp_stats.get('empty_pages'):
-        st.caption(f"ℹ️ {bp_stats['empty_pages']} pages have almost nothing left after removal and are flagged "
-                   f"as mostly shared template.")
+    thin_count = int(df['Page Note'].astype(bool).sum())
+    if thin_count:
+        st.caption(f"ℹ️ {thin_count} pages have less than {boilerplate.THIN_PAGE_MAX_UNIQUE_PCT}% unique content "
+                   f"left after removal. They are marked as mostly shared template in the **Page Note** column.")
 elif strip_boilerplate:
     st.caption(f"🧹 Repeated-block removal not applied: {bp_stats['reason']}")
 
-# ---------------------------------------------------------------- settings / cost
-settings_label = (f"model={MODEL}; boilerplate="
-                  f"{('on@' + str(int(boilerplate_threshold * 100)) + '%') if bp_stats['applied'] else 'off'}; "
-                  f"max_tokens={MAX_TOKENS}")
-if 'Embedding Settings' in df.columns and existing_count:
-    previous = {str(v) for v in df['Embedding Settings'].dropna().unique() if str(v).strip()}
-    mismatched = {p for p in previous if p != settings_label}
-    if mismatched:
-        st.warning("⚠️ The embeddings in this file were made with different settings "
-                   f"({'; '.join(sorted(mismatched))}). They are not comparable with new ones. "
-                   "Either match the settings in the sidebar, or remove the Embedding column to regenerate them.")
-
+# ---------------------------------------------------------------- cost
 st.header("💰 Cost Estimation")
 c1, c2 = st.columns(2)
 missing_texts = [t for t, e in zip(clean_texts, df['Embedding']) if not isinstance(e, np.ndarray)]
@@ -278,12 +303,17 @@ def run_analysis(df):
     # Step 1 – embeddings (built from the text with repeated blocks removed)
     if missing_count:
         progress = st.progress(0.0, text="Step 1/3: Generating AI embeddings...")
+        was_missing = [not isinstance(e, np.ndarray) for e in df['Embedding']]
         emb = generate_embeddings(
             df['Clean Content'].tolist(), df['URL'].astype(str).tolist(), api_key,
             existing=df['Embedding'].tolist(),
             progress_callback=lambda done, total, p: progress.progress(p, text=f"Step 1/3: Embedding {done}/{total} pages..."))
         df['Embedding'] = emb['embeddings']
-        df['Embedding Settings'] = settings_label
+        # Label only the rows made now – uploaded rows keep their own settings record
+        settings = df['Embedding Settings'].fillna('').astype(str).tolist() \
+            if 'Embedding Settings' in df.columns else [''] * len(df)
+        df['Embedding Settings'] = [settings_label if m and isinstance(e, np.ndarray) else s
+                                    for m, e, s in zip(was_missing, df['Embedding'], settings)]
         run['new_embeddings'] = emb['new_count']
         if emb.get('trimmed'):
             run['warnings'].append(f"{emb['trimmed']} pages were longer than the model's limit and were trimmed "
@@ -311,11 +341,11 @@ def run_analysis(df):
         return
 
     # Step 3 – full-page overlap on the raw text (free, no API)
-    raw_df = df.rename(columns={'Content': 'Content'})
     try:
         progress = st.progress(0.0, text="Step 3/3: Measuring full-page overlap...")
+        tfidf_matrix = build_matrix(df['Content'].fillna('').astype(str).tolist(), filter_common=False)
         pairs = [(r['URL 1'], r['URL 2']) for r in results]
-        overlap = calculate_tfidf_for_pairs(raw_df, pairs, filter_common=False) if pairs else {}
+        overlap = calculate_tfidf_for_pairs(df, pairs, tfidf_matrix=tfidf_matrix) if pairs else {}
         for r in results:
             r['Full-page Overlap'] = overlap.get(tuple(sorted([r['URL 1'], r['URL 2']])), 0.0)
 
@@ -325,9 +355,9 @@ def run_analysis(df):
             emb_by_url, thin = {}, {}
             for u, e, pct in zip(df['URL'], df['Embedding'], df['Unique Content %']):
                 emb_by_url.setdefault(u, e)
-                thin.setdefault(u, pct < THIN_PAGE_MAX_UNIQUE_PCT)
+                thin.setdefault(u, boilerplate.is_thin(pct))
             extra = 0
-            for t in calculate_tfidf_similarity(raw_df, threshold=TEMPLATE_TWIN_MIN, filter_common=False):
+            for t in calculate_tfidf_similarity(df, threshold=TEMPLATE_TWIN_MIN, tfidf_matrix=tfidf_matrix):
                 key = tuple(sorted([t['URL 1'], t['URL 2']]))
                 if key in known or not (thin.get(t['URL 1']) and thin.get(t['URL 2'])):
                     continue
@@ -356,6 +386,10 @@ def run_analysis(df):
             for _, r in results_df.iterrows()])
         results_df['Unique Content % 1'] = results_df['URL 1'].map(unique_pct)
         results_df['Unique Content % 2'] = results_df['URL 2'].map(unique_pct)
+        if 'Page Note' in df.columns:
+            notes = dict(zip(df['URL'].astype(str), df['Page Note']))
+            results_df['Page Note 1'] = results_df['URL 1'].map(notes)
+            results_df['Page Note 2'] = results_df['URL 2'].map(notes)
         results_df = results_df.sort_values('Semantic Similarity', ascending=False, na_position='last')
         run['results_df'] = results_df.reset_index(drop=True)
 
@@ -398,11 +432,15 @@ if run:
     ]
     if results_df is not None:
         level_counts = results_df['Similarity Level'].value_counts()
+        # Template twins sit below the threshold by definition – keep them out of the score stats
+        above = results_df.loc[results_df['Semantic Similarity'] >= run['settings']['threshold'],
+                               'Semantic Similarity']
         summary_rows += [('Similar Pairs Found', len(results_df))] + \
             [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER] + [
-            ('Average Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].mean())),
-            ('Maximum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].max())),
-            ('Minimum Semantic Similarity', fmt_pct(results_df['Semantic Similarity'].min())),
+            ('Pairs At or Above Threshold', len(above)),
+            ('Average Semantic Similarity (above threshold)', fmt_pct(above.mean())),
+            ('Maximum Semantic Similarity (above threshold)', fmt_pct(above.max())),
+            ('Minimum Semantic Similarity (above threshold)', fmt_pct(above.min())),
         ]
     summary_rows += [
         ('Similarity Threshold Used', f"{run['settings']['threshold'] * 100:.0f}%"),
@@ -435,6 +473,11 @@ if run:
                 help="One file: " + ", ".join(name for name, _ in sheets) + ". "
                      "Re-upload it later to reuse the embeddings.")
             st.caption("Sheets: " + " · ".join(name for name, _ in sheets))
+            too_long = count_over_cell_limit(rdf['Content'])
+            if too_long:
+                st.caption(f"ℹ️ {too_long} pages are longer than Excel's {EXCEL_CELL_LIMIT:,}-character cell limit "
+                           f"and are shortened in this file. To re-upload with the full text, use the "
+                           f"*Data + Embeddings CSV* below.")
             excel_ok = True
         except Exception as e:
             st.warning(f"⚠️ Could not build the Excel file ({e}) – download the CSV files below instead.")
@@ -444,7 +487,7 @@ if run:
         c1, c2, c3 = st.columns(3)
         with c1:
             if n_emb:
-                st.download_button(f"Data + Embeddings CSV", data=embeddings_csv(rdf, has_categories),
+                st.download_button("Data + Embeddings CSV", data=embeddings_csv(rdf, has_categories),
                                    file_name=f"embeddings_{ts}.csv", mime="text/csv",
                                    width="stretch", key="dl_embeddings")
         if results_df is not None:
@@ -468,7 +511,8 @@ if run:
     cols = st.columns(max(len(shown_levels), 1) + 1)
     for col, label in zip(cols, shown_levels):
         col.metric(label, int(level_counts[label]))
-    cols[-1].metric("Avg Similarity", fmt_pct(results_df['Semantic Similarity'].mean()))
+    cols[-1].metric("Avg Similarity", fmt_pct(above.mean()),
+                    help="Pairs at or above the threshold only – template twins are left out.")
 
     if 'Overlap Type' in results_df.columns:
         st.subheader("🧩 What kind of overlap")

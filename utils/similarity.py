@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 
 # Similarity levels, checked from the top down. (min score, label, short description)
 SIMILARITY_LEVELS = [
@@ -91,7 +90,6 @@ def calculate_similarities(df, threshold=0.85, progress_callback=None, block_siz
 # --------------------------------------------------------------- overlap types
 FULL_OVERLAP_HIGH = 0.70     # raw-text word overlap counted as "same words"
 TEMPLATE_TWIN_MIN = 0.80     # raw overlap that makes a pair worth showing on its own
-THIN_PAGE_MAX_UNIQUE_PCT = 40  # below this a page is mostly shared template
 MAX_TEMPLATE_TWIN_PAIRS = 5000
 
 

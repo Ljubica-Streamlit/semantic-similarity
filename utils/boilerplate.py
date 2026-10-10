@@ -8,6 +8,7 @@ from collections import Counter
 MIN_PAGES = 10          # below this there is not enough repetition to judge
 MIN_BLOCK_CHARS = 8     # ignore single words
 DEFAULT_THRESHOLD = 0.8  # a block must appear on this share of pages to be removed
+THIN_PAGE_MAX_UNIQUE_PCT = 40  # below this a page is mostly shared template
 
 _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:])\s+|(?<=[.!?])(?=[A-Z])|\n+|\s{3,}|(?<=[a-z])(?=[A-Z][a-z]+\s)')
 _WS = re.compile(r'\s+')
@@ -74,8 +75,12 @@ def analyse(texts, threshold=DEFAULT_THRESHOLD, min_pages=MIN_PAGES):
     return cleaned, stats
 
 
+def is_thin(unique_pct):
+    return unique_pct < THIN_PAGE_MAX_UNIQUE_PCT
+
+
 def thin_page_note(unique_pct, cleaned_text):
     """Short label for pages that are mostly shared template."""
-    if unique_pct < 20 or len(cleaned_text.strip()) < 200:
+    if is_thin(unique_pct):
         return f"⚠️ mostly shared template ({len(cleaned_text.strip())} unique characters)"
     return ''

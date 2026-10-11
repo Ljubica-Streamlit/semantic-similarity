@@ -15,8 +15,9 @@ from utils.similarity import (
 from utils import boilerplate
 from utils.tfidf import build_matrix, calculate_tfidf_for_pairs, calculate_tfidf_similarity
 from utils.groups import group_pages, groups_frame, pair_groups, DECISIONS
+from utils.templates import group_twins, page_blocks, shared_text, templates_frame, TEMPLATE_SHARED_MIN
 from utils.export import (
-    embeddings_csv, results_csv, groups_csv, summary_csv, excel_workbook, embeddings_frame, results_frame,
+    embeddings_csv, results_csv, groups_csv, templates_csv, summary_csv, excel_workbook, embeddings_frame, results_frame,
     count_over_cell_limit, looks_cut_by_excel, EXCEL_CELL_LIMIT,
 )
 from utils.columns import load_table, detect_columns, column_labels, build_dataframe
@@ -272,7 +273,7 @@ if bp_stats['applied']:
         st.warning(f"⚠️ The repeated blocks make up {100 - bp_stats['avg_unique_pct']:.0f}% of the average page. "
                    f"These pages may be template variants (e.g. location or product pages) whose shared text is "
                    f"the finding itself. You can continue – pairs that match mainly through shared blocks are "
-                   f"labelled **Template twins** – or raise the threshold / switch removal off in the sidebar.")
+                   f"listed in the **Template Groups** sheet – or raise the threshold / switch removal off in the sidebar.")
     thin_count = int(df['Page Note'].astype(bool).sum())
     if thin_count:
         st.caption(f"ℹ️ {thin_count} pages have less than {boilerplate.THIN_PAGE_MAX_UNIQUE_PCT}% unique content "
@@ -353,6 +354,7 @@ def run_analysis(df):
         run['warnings'].append(f"Pairs per threshold could not be counted: {e}")
 
     # Step 3 – full-page overlap on the raw text (free, no API)
+    twins = []
     try:
         progress = st.progress(0.0, text="Step 3/3: Measuring full-page overlap...")
         tfidf_matrix = build_matrix(df['Content'].fillna('').astype(str).tolist(), filter_common=False)
@@ -361,16 +363,13 @@ def run_analysis(df):
         for r in results:
             r['Full-page Overlap'] = overlap.get(tuple(sorted([r['URL 1'], r['URL 2']])), 0.0)
 
-        # Pages that match mainly through shared blocks would otherwise disappear – keep them, labelled.
+        # Pages that match mainly through shared blocks would otherwise disappear – they get their own sheet.
         if bp_stats['applied']:
             known = set(overlap.keys())
-            emb_by_url, thin, cat_by_url = {}, {}, {}
-            cats = df['Category'].where(df['Category'].notna(), 'N/A') if 'Category' in df.columns else None
-            for k, (u, e, pct) in enumerate(zip(df['URL'], df['Embedding'], df['Unique Content %'])):
+            emb_by_url, thin = {}, {}
+            for u, e, pct in zip(df['URL'], df['Embedding'], df['Unique Content %']):
                 emb_by_url.setdefault(u, e)
                 thin.setdefault(u, boilerplate.is_thin(pct))
-                if cats is not None:
-                    cat_by_url.setdefault(u, cats.iloc[k])
             extra = 0
             for t in calculate_tfidf_similarity(df, threshold=TEMPLATE_TWIN_MIN, tfidf_matrix=tfidf_matrix):
                 key = tuple(sorted([t['URL 1'], t['URL 2']]))
@@ -389,36 +388,37 @@ def run_analysis(df):
                         f"More than {MAX_TEMPLATE_TWIN_PAIRS:,} template-twin pairs were found – only the "
                         f"first {MAX_TEMPLATE_TWIN_PAIRS:,} are listed.")
                     break
-                twin = {'URL 1': t['URL 1'], 'URL 2': t['URL 2'], 'Semantic Similarity': sem}
-                if cats is not None:
-                    c1, c2 = cat_by_url.get(t['URL 1']), cat_by_url.get(t['URL 2'])
-                    twin.update({'Category 1': c1, 'Category 2': c2, 'Same Category?': c1 == c2})
-                twin['Full-page Overlap'] = t['TF-IDF Similarity']
-                results.append(twin)
+                twins.append({'URL 1': t['URL 1'], 'URL 2': t['URL 2'], 'Semantic Similarity': sem,
+                              'Full-page Overlap': t['TF-IDF Similarity']})
         progress.progress(1.0, text="Step 3/3: Full-page overlap done")
     except Exception as e:
         run['warnings'].append(f"Full-page overlap could not be calculated: {e}")
 
+    unique_pct = dict(zip(df['URL'].astype(str), df['Unique Content %']))
+    notes = dict(zip(df['URL'].astype(str), df['Page Note'])) if 'Page Note' in df.columns else None
+    cats = dict(zip(df['URL'].astype(str), df['Category'])) if has_categories else None
+    if twins:
+        try:
+            run['templates_df'] = build_templates(df, twins, unique_pct, notes, cats)
+        except Exception as e:
+            run['warnings'].append(f"Template groups could not be built: {e}")
+            run['trace'] = traceback.format_exc()
+
     if results:
         results_df = pd.DataFrame(results)
-        unique_pct = dict(zip(df['URL'].astype(str), df['Unique Content %']))
-        # Levels only judge pairs at or above the threshold – template twins were never scored at a level
-        results_df.insert(2, 'Similarity Level', results_df['Semantic Similarity'].apply(
-            lambda s: categorize_similarity(s) if pd.notna(s) and s >= similarity_threshold else '–'))
+        results_df.insert(2, 'Similarity Level', results_df['Semantic Similarity'].apply(categorize_similarity))
         results_df.insert(3, 'Overlap Type', [
             classify_overlap(r['Semantic Similarity'], r.get('Full-page Overlap'), similarity_threshold)
             for _, r in results_df.iterrows()])
         results_df['Unique Content % 1'] = results_df['URL 1'].map(unique_pct)
         results_df['Unique Content % 2'] = results_df['URL 2'].map(unique_pct)
-        notes = None
-        if 'Page Note' in df.columns:
-            notes = dict(zip(df['URL'].astype(str), df['Page Note']))
+        if notes is not None:
             results_df['Page Note 1'] = results_df['URL 1'].map(notes)
             results_df['Page Note 2'] = results_df['URL 2'].map(notes)
         results_df = results_df.sort_values('Semantic Similarity', ascending=False, na_position='last')
 
-        # Topic groups from pairs at or above the threshold (template twins are a different finding)
-        main = results_df[results_df['Semantic Similarity'] >= similarity_threshold]
+        # Topic groups from the pairs (template twins are a different finding, in their own sheet)
+        main = results_df
         if len(main):
             try:
                 emb_by_url = {}
@@ -427,11 +427,34 @@ def run_analysis(df):
                 pages = sorted(set(main['URL 1']) | set(main['URL 2']))
                 membership, group_stats = group_pages(pages, [emb_by_url[u] for u in pages], similarity_threshold)
                 results_df.insert(4, 'Group', pair_groups(results_df, membership))
-                cats = dict(zip(df['URL'].astype(str), df['Category'])) if has_categories else None
                 run['groups_df'] = groups_frame(main, membership, group_stats, unique_pct, notes, cats)
             except Exception as e:
                 run['warnings'].append(f"Topic groups could not be built: {e}")
         run['results_df'] = results_df.reset_index(drop=True)
+
+
+def build_templates(df, twins, unique_pct, notes, cats):
+    """Template Groups sheet: grouped by the text left after site-wide blocks are removed."""
+    first = {}
+    for i, u in enumerate(df['URL'].astype(str)):
+        first.setdefault(u, i)
+    pages = sorted({t['URL 1'] for t in twins} | {t['URL 2'] for t in twins})
+    rows = [first[u] for u in pages]
+    clean = df['Clean Content'].fillna('').astype(str).tolist()
+    remaining = build_matrix(clean, filter_common=False)  # IDF from the whole site
+    shared = (remaining[rows] @ remaining[rows].T).toarray()  # rows are L2-normalised
+    membership = group_twins(pages, shared)
+
+    blocks = [page_blocks(t) for t in clean]
+    site_counts = {}
+    for page in blocks:
+        for key in page:
+            site_counts[key] = site_counts.get(key, 0) + 1
+    members = {}
+    for url, group in membership.items():
+        members.setdefault(group, []).append(first[url])
+    names = {g: shared_text([blocks[i] for i in idx], site_counts, len(clean)) for g, idx in members.items()}
+    return templates_frame(twins, membership, names, unique_pct, notes, cats)
 
 
 if st.button("🚀 Start Analysis", type="primary", width="stretch"):
@@ -464,6 +487,9 @@ if run:
 
     results_df = run['results_df']
     groups_df = run.get('groups_df')
+    templates_df = run.get('templates_df')
+    has_groups = groups_df is not None and len(groups_df) > 0
+    has_templates = templates_df is not None and len(templates_df) > 0
     data_sheet = ('Data + Embeddings', embeddings_frame(rdf, has_categories))
 
     summary_rows = [
@@ -472,26 +498,29 @@ if run:
         ('New Embeddings Generated', run['new_embeddings']),
     ]
     if results_df is not None:
-        # Template twins sit below the threshold by definition – keep them out of the levels and score stats
-        is_above = results_df['Semantic Similarity'] >= run['settings']['threshold']
-        above = results_df.loc[is_above, 'Semantic Similarity']
-        level_counts = results_df.loc[is_above, 'Similarity Level'].value_counts()
-        summary_rows += [('Similar Pairs Found (at or above threshold)', len(above))] + \
-            [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER] + [
-            ('Template Twin Pairs (listed separately)', int((~is_above).sum())),
-        ]
-    if groups_df is not None and len(groups_df):
+        level_counts = results_df['Similarity Level'].value_counts()
+        summary_rows += [('Similar Pairs Found', len(results_df))] + \
+            [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER]
+    if has_groups:
         grouped = groups_df['Group'].notna()
         summary_rows += [
             ('Topic Groups', int(groups_df.loc[grouped, 'Group'].nunique())),
             ('Pages in Topic Groups', int(grouped.sum())),
             ('Similar Pages Not in a Group', int((~grouped).sum())),
         ]
-    if results_df is not None:
+    if has_templates:
+        in_template = templates_df['Template Group'].notna()
         summary_rows += [
-            ('Average Semantic Similarity (above threshold)', fmt_pct(above.mean())),
-            ('Maximum Semantic Similarity (above threshold)', fmt_pct(above.max())),
-            ('Minimum Semantic Similarity (above threshold)', fmt_pct(above.min())),
+            ('Template Groups', int(templates_df.loc[in_template, 'Template Group'].nunique())),
+            ('Pages in Template Groups', int(in_template.sum())),
+            ('Template Pages Not in a Group', int((~in_template).sum())),
+        ]
+    if results_df is not None:
+        scores = results_df['Semantic Similarity']
+        summary_rows += [
+            ('Average Semantic Similarity', fmt_pct(scores.mean())),
+            ('Maximum Semantic Similarity', fmt_pct(scores.max())),
+            ('Minimum Semantic Similarity', fmt_pct(scores.min())),
         ]
     summary_rows += [
         ('Similarity Threshold Used', f"{run['settings']['threshold'] * 100:.0f}%"),
@@ -503,6 +532,7 @@ if run:
     ] + ([(f"Overlap type: {k}", int(v)) for k, v in results_df['Overlap Type'].value_counts().items()]
          if results_df is not None and 'Overlap Type' in results_df.columns else [])
     summary_sheet = ('Summary', pd.DataFrame(summary_rows, columns=['Metric', 'Value']).astype(str))
+    has_findings = results_df is not None or has_templates
 
     # One Excel file with every sheet. Embeddings are always included – the user paid for them.
     st.header("⬇️ Download")
@@ -510,17 +540,18 @@ if run:
         st.info(f"💾 Your {n_emb} embeddings are saved in the file below. Upload it again to continue "
                 f"without paying for them twice.")
 
-    has_groups = groups_df is not None and len(groups_df) > 0
     sheets = ([('Groups', results_frame(groups_df))] if has_groups else []) + \
+        ([('Template Groups', results_frame(templates_df))] if has_templates else []) + \
         ([('Similarity Results', results_frame(results_df))] if results_df is not None else []) + \
         [summary_sheet, data_sheet]
     excel_ok = False
-    if n_emb or results_df is not None:
+    if n_emb or has_findings:
         try:
-            label = "📥 Download Results (Excel)" if results_df is not None else \
+            label = "📥 Download Results (Excel)" if has_findings else \
                 f"📥 Download Embeddings (Excel, {n_emb}/{len(rdf)} pages)"
+            dropdowns = {'Groups': {'Decision': DECISIONS}, 'Template Groups': {'Decision': DECISIONS}}
             st.download_button(
-                label=label, data=excel_workbook(sheets, dropdowns={'Groups': {'Decision': DECISIONS}}),
+                label=label, data=excel_workbook(sheets, dropdowns=dropdowns),
                 file_name=f"semantic_similarity_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary", width="stretch", key="dl_excel", on_click="ignore",
@@ -538,29 +569,56 @@ if run:
 
     # CSV versions: tucked away normally, shown openly if Excel failed
     with st.expander("Prefer CSV files?", expanded=not excel_ok):
-        c1, c2, c3, c4 = st.columns(4)
-        if has_groups:
-            with c4:
-                st.download_button("Groups CSV", data=groups_csv(groups_df),
-                                   file_name=f"similarity_groups_{ts}.csv", mime="text/csv",
-                                   width="stretch", key="dl_groups", on_click="ignore")
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             if n_emb:
                 st.download_button("Data + Embeddings CSV", data=embeddings_csv(rdf, has_categories),
                                    file_name=f"embeddings_{ts}.csv", mime="text/csv",
                                    width="stretch", key="dl_embeddings", on_click="ignore")
-        if results_df is not None:
+        if has_groups:
             with c2:
+                st.download_button("Groups CSV", data=groups_csv(groups_df),
+                                   file_name=f"similarity_groups_{ts}.csv", mime="text/csv",
+                                   width="stretch", key="dl_groups", on_click="ignore")
+        if has_templates:
+            with c3:
+                st.download_button("Template Groups CSV", data=templates_csv(templates_df),
+                                   file_name=f"similarity_templates_{ts}.csv", mime="text/csv",
+                                   width="stretch", key="dl_templates", on_click="ignore")
+        if results_df is not None:
+            with c4:
                 st.download_button("Similarity Results CSV", data=results_csv(results_df),
                                    file_name=f"similarity_results_{ts}.csv", mime="text/csv",
                                    width="stretch", key="dl_results", on_click="ignore")
-            with c3:
+        if has_findings:
+            with c5:
                 st.download_button("Summary CSV", data=summary_csv(summary_rows),
                                    file_name=f"similarity_summary_{ts}.csv", mime="text/csv",
                                    width="stretch", key="dl_summary", on_click="ignore")
 
+    def show_templates():
+        st.subheader("🧱 Template Groups")
+        in_group = templates_df['Template Group'].notna()
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Template groups", int(templates_df.loc[in_group, 'Template Group'].nunique()))
+        t2.metric("Pages in template groups", int(in_group.sum()))
+        t3.metric("Template pages not in a group", int((~in_group).sum()))
+        st.caption(f"Thin pages (less than {boilerplate.THIN_PAGE_MAX_UNIQUE_PCT}% unique content) that match mainly "
+                   f"through text they share. Pages are grouped by the text left after site-wide blocks are "
+                   f"removed: every page in a group shares at least {TEMPLATE_SHARED_MIN * 100:.0f}% of it with "
+                   f"every other. *Shared Text* is the block that sets the group apart – common in the group, "
+                   f"rare elsewhere on the site. Record verdicts in the Template Groups sheet.")
+        shown = templates_df.drop(columns=['Decision', 'Notes']).copy()
+        for col in ('Full-page Overlap', 'Semantic Similarity'):
+            shown[col] = shown[col].apply(fmt_pct)
+        st.dataframe(shown, width="stretch", hide_index=True, height=400)
+
     if results_df is None:
-        if not run['errors']:
+        if has_templates:
+            st.info(f"ℹ️ No page pairs at or above {run['settings']['threshold'] * 100:.0f}% – but some pages share "
+                    f"a template. See **Template Groups** below, or lower the threshold to look for similar pairs.")
+            show_templates()
+        elif not run['errors']:
             st.warning(f"⚠️ No similar pairs found at or above {run['settings']['threshold'] * 100:.0f}%. "
                        f"Try lowering the threshold.")
         st.stop()
@@ -570,8 +628,7 @@ if run:
     cols = st.columns(max(len(shown_levels), 1) + 1)
     for col, label in zip(cols, shown_levels):
         col.metric(label, int(level_counts[label]))
-    cols[-1].metric("Avg Similarity", fmt_pct(above.mean()),
-                    help="Pairs at or above the threshold only – template twins are left out.")
+    cols[-1].metric("Avg Similarity", fmt_pct(results_df['Semantic Similarity'].mean()))
 
     if 'Overlap Type' in results_df.columns:
         st.subheader("🧩 What kind of overlap")
@@ -581,16 +638,11 @@ if run:
             col.metric(label, int(count))
         st.caption("**Same content** – the unique text matches too. "
                    "**Same topic, different wording** – same subject, written differently. "
-                   f"**Template twins** – the pages match mainly through blocks they share, and are at least "
-                   f"{TEMPLATE_TWIN_MIN_SEMANTIC * 100:.0f}% alike in meaning.")
+                   "Pages that match mainly through shared template text are in **Template Groups** below.")
 
     st.subheader("📈 Similarity Level Distribution")
     dist = pd.DataFrame({'Pairs': [int(level_counts.get(l, 0)) for l in LEVEL_ORDER]}, index=LEVEL_ORDER)
-    if dist['Pairs'].any():
-        st.bar_chart(dist[dist['Pairs'] > 0])
-        st.caption("Pairs at or above the threshold. Template twins are counted under **What kind of overlap**.")
-    else:
-        st.caption(f"No pairs at or above {run['settings']['threshold'] * 100:.0f}% – only template twins were found.")
+    st.bar_chart(dist[dist['Pairs'] > 0])
 
     if run.get('pair_counts'):
         st.subheader("🎚️ Pairs at Each Threshold")
@@ -598,8 +650,8 @@ if run:
         st.dataframe(pd.DataFrame([{'Threshold': f"{c * 100:.0f}%" + ("  ← used" if abs(c - current) < 1e-9 else ""),
                                     'Similar pairs': n} for c, n in run['pair_counts'].items()]),
                      hide_index=True)
-        st.caption("Template twins not included. Change the threshold in the sidebar and run again to see a "
-                   "different cut – existing embeddings are reused, so it costs nothing.")
+        st.caption("Change the threshold in the sidebar and run again to see a different cut – existing "
+                   "embeddings are reused, so it costs nothing.")
 
     if has_groups:
         st.subheader("🗂️ Topic Groups")
@@ -610,14 +662,17 @@ if run:
         g3.metric("Similar pages not in a group", int((~grouped).sum()))
         st.caption(f"Every page in a group is at least {run['settings']['threshold'] * 100:.0f}% similar to every "
                    f"other page in it. Groups are sorted by *Best Pair* (their closest two pages), so likely "
-                   f"duplicates come first; *Group Strength* rates the *Weakest Link*. *Also Close To Group* "
-                   f"flags a page whose closest match sits in another group it doesn't fully fit. Pages with no "
-                   f"Group match something but no whole group. Record verdicts in **Decision** and **Notes** in "
-                   f"the Groups sheet.")
+                   f"duplicates come first; *Group Cohesion* rates the *Weakest Link* – how alike the whole group "
+                   f"is. *Also Close To Group* flags a page whose closest match sits in another group it doesn't "
+                   f"fully fit. Pages with no Group match something but no whole group. Record verdicts in "
+                   f"**Decision** and **Notes** in the Groups sheet.")
         shown = groups_df.drop(columns=['Decision', 'Notes']).copy()
         for col in ('Best Pair', 'Weakest Link', 'Closest Match Score'):
             shown[col] = shown[col].apply(fmt_pct)
         st.dataframe(shown, width="stretch", hide_index=True, height=400)
+
+    if has_templates:
+        show_templates()
 
     st.subheader("🔝 Top 10 Most Similar Pairs")
     st.caption("\"Semantic Similarity\" compares the unique content; \"Full-page Overlap\" compares the raw text.")

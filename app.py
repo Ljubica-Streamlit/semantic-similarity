@@ -122,6 +122,7 @@ file_id = hashlib.md5(raw_bytes).hexdigest()
 if st.session_state.get('file_id') != file_id:
     st.session_state['file_id'] = file_id
     st.session_state.pop('run', None)
+    st.session_state['emb_cache'] = {}
 
 try:
     raw = load_table(uploaded_file.name, raw_bytes)
@@ -231,6 +232,33 @@ if 'Embedding Settings' in df.columns:
     mismatched_count = int(stale.sum())
     df['Embedding'] = [None if s else e for e, s in zip(df['Embedding'], stale)]
 
+
+def cache_key(url, text):
+    """An embedding is only reusable for the same page text (and, by its cache bucket, the same settings)."""
+    return url, hashlib.md5(str(text).encode('utf-8')).hexdigest()
+
+
+# Embeddings already paid for earlier in this session (e.g. before changing the threshold) are reused.
+# One bucket per embedding settings; only the two most recent are kept to stay within free-hosting memory.
+EMB_CACHE_SETTINGS = 2
+emb_buckets = st.session_state.setdefault('emb_cache', {})
+emb_cache = emb_buckets.get(settings_label, {})
+reused_count = 0
+if emb_cache:
+    filled, labels_now = [], []
+    old_labels = df['Embedding Settings'].fillna('').astype(str).tolist() \
+        if 'Embedding Settings' in df.columns else [''] * len(df)
+    for u, t, e, lab in zip(df['URL'].astype(str), df['Clean Content'], df['Embedding'], old_labels):
+        cached = None if isinstance(e, np.ndarray) else emb_cache.get(cache_key(u, t))
+        if cached is not None:
+            e, lab = cached, settings_label
+            reused_count += 1
+        filled.append(e)
+        labels_now.append(lab)
+    df['Embedding'] = filled
+    if reused_count:
+        df['Embedding Settings'] = labels_now
+
 existing_count = count_valid(df['Embedding'])
 missing_count = len(df) - existing_count
 has_categories = 'Category' in df.columns and not df['Category'].isna().all()
@@ -247,8 +275,13 @@ if duplicate_urls:
 if mismatched_count:
     st.warning(f"⚠️ {mismatched_count} embeddings in this file were made with different settings "
                f"({'; '.join(sorted(mismatched_settings))}) and can't be compared with the current ones "
-               f"({settings_label}). They will be generated again. To reuse them instead, match the settings "
-               f"in the sidebar.")
+               f"({settings_label}). "
+               + ("They were already generated again earlier in this session, so this costs nothing. "
+                  if reused_count >= mismatched_count else "They will be generated again. ")
+               + "To use the file's own embeddings instead, match the settings in the sidebar.")
+elif reused_count:
+    st.info(f"♻️ {reused_count} embeddings from your earlier run in this session are reused – no new cost"
+            + (f", {missing_count} still to generate." if missing_count else "."))
 elif embedding_col and 0 < existing_count < len(df):
     st.info(f"ℹ️ {missing_count} rows have no embedding – only those will be generated.")
 if cut_by_excel:
@@ -323,6 +356,14 @@ def run_analysis(df):
             if 'Embedding Settings' in df.columns else [''] * len(df)
         df['Embedding Settings'] = [settings_label if m and isinstance(e, np.ndarray) else s
                                     for m, e, s in zip(was_missing, df['Embedding'], settings)]
+        # Keep what was paid for, even if the run stopped early, so running again doesn't pay twice
+        bucket = emb_buckets.pop(settings_label, {})
+        for m, u, t, e in zip(was_missing, df['URL'].astype(str), df['Clean Content'], df['Embedding']):
+            if m and isinstance(e, np.ndarray):
+                bucket[cache_key(u, t)] = e
+        emb_buckets[settings_label] = bucket  # most recent last
+        while len(emb_buckets) > EMB_CACHE_SETTINGS:
+            emb_buckets.pop(next(iter(emb_buckets)))
         run['new_embeddings'] = emb['new_count']
         if emb.get('trimmed'):
             trimmed = emb['trimmed']

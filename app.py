@@ -324,8 +324,11 @@ def run_analysis(df):
                                     for m, e, s in zip(was_missing, df['Embedding'], settings)]
         run['new_embeddings'] = emb['new_count']
         if emb.get('trimmed'):
-            run['warnings'].append(f"{emb['trimmed']} pages were longer than the model's limit and were trimmed "
-                                   f"to their first ~{MAX_TOKENS:,} tokens.")
+            trimmed = emb['trimmed']
+            run['warnings'].append(
+                ("1 page was" if len(trimmed) == 1 else f"{len(trimmed)} pages were") +
+                f" longer than the model's limit, so only the first ~{MAX_TOKENS:,} tokens were compared: " +
+                ", ".join(trimmed[:20]) + (" ..." if len(trimmed) > 20 else ""))
         if emb['skipped_rows']:
             run['warnings'].append(
                 f"{len(emb['skipped_rows'])} pages could not be embedded and were left out: " +

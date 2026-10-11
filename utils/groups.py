@@ -77,7 +77,7 @@ def groups_frame(pairs, membership, stats, unique_pct=None, notes=None, categori
         row = {
             'Group': group,
             'Pages in Group': sizes.get(group),
-            'Group Strength': categorize_similarity(info['weakest']) if info else None,
+            'Group Cohesion': categorize_similarity(info['weakest']) if info else None,
             'Best Pair': info.get('best', np.nan),
             'Weakest Link': info.get('weakest', np.nan),
             'URL': page,

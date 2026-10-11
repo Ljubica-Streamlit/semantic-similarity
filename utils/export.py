@@ -54,6 +54,10 @@ def groups_csv(groups_df):
     return _report_csv(results_frame(groups_df))
 
 
+def templates_csv(templates_df):
+    return _report_csv(results_frame(templates_df))
+
+
 def _report_csv(out):
     for col in out.columns:
         if not pd.api.types.is_numeric_dtype(out[col]):

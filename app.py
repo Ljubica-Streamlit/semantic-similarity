@@ -10,7 +10,7 @@ import streamlit as st
 from utils.embeddings import generate_embeddings, estimate_cost, MODEL, MAX_TOKENS
 from utils.similarity import (
     calculate_similarities, calculate_cosine_similarity, categorize_similarity, classify_overlap,
-    SIMILARITY_LEVELS, LEVEL_ORDER, TEMPLATE_TWIN_MIN, MAX_TEMPLATE_TWIN_PAIRS,
+    SIMILARITY_LEVELS, LEVEL_ORDER, TEMPLATE_TWIN_MIN, TEMPLATE_TWIN_MIN_SEMANTIC, MAX_TEMPLATE_TWIN_PAIRS,
 )
 from utils import boilerplate
 from utils.tfidf import build_matrix, calculate_tfidf_for_pairs, calculate_tfidf_similarity
@@ -355,14 +355,24 @@ def run_analysis(df):
         # Pages that match mainly through shared blocks would otherwise disappear – keep them, labelled.
         if bp_stats['applied']:
             known = set(overlap.keys())
-            emb_by_url, thin = {}, {}
-            for u, e, pct in zip(df['URL'], df['Embedding'], df['Unique Content %']):
+            emb_by_url, thin, cat_by_url = {}, {}, {}
+            cats = df['Category'].where(df['Category'].notna(), 'N/A') if 'Category' in df.columns else None
+            for k, (u, e, pct) in enumerate(zip(df['URL'], df['Embedding'], df['Unique Content %'])):
                 emb_by_url.setdefault(u, e)
                 thin.setdefault(u, boilerplate.is_thin(pct))
+                if cats is not None:
+                    cat_by_url.setdefault(u, cats.iloc[k])
             extra = 0
             for t in calculate_tfidf_similarity(df, threshold=TEMPLATE_TWIN_MIN, tfidf_matrix=tfidf_matrix):
                 key = tuple(sorted([t['URL 1'], t['URL 2']]))
                 if key in known or not (thin.get(t['URL 1']) and thin.get(t['URL 2'])):
+                    continue
+                e1, e2 = emb_by_url.get(t['URL 1']), emb_by_url.get(t['URL 2'])
+                sem = (calculate_cosine_similarity(e1, e2)
+                       if isinstance(e1, np.ndarray) and isinstance(e2, np.ndarray) else np.nan)
+                # Shared blocks alone (e.g. the same form on a webinar and a contact page) don't make twins.
+                # No URL or folder rule here: real twins can live in different directories.
+                if pd.notna(sem) and sem < TEMPLATE_TWIN_MIN_SEMANTIC:
                     continue
                 extra += 1
                 if extra > MAX_TEMPLATE_TWIN_PAIRS:
@@ -370,11 +380,12 @@ def run_analysis(df):
                         f"More than {MAX_TEMPLATE_TWIN_PAIRS:,} template-twin pairs were found – only the "
                         f"first {MAX_TEMPLATE_TWIN_PAIRS:,} are listed.")
                     break
-                e1, e2 = emb_by_url.get(t['URL 1']), emb_by_url.get(t['URL 2'])
-                sem = (calculate_cosine_similarity(e1, e2)
-                       if isinstance(e1, np.ndarray) and isinstance(e2, np.ndarray) else np.nan)
-                results.append({'URL 1': t['URL 1'], 'URL 2': t['URL 2'], 'Semantic Similarity': sem,
-                                'Full-page Overlap': t['TF-IDF Similarity']})
+                twin = {'URL 1': t['URL 1'], 'URL 2': t['URL 2'], 'Semantic Similarity': sem}
+                if cats is not None:
+                    c1, c2 = cat_by_url.get(t['URL 1']), cat_by_url.get(t['URL 2'])
+                    twin.update({'Category 1': c1, 'Category 2': c2, 'Same Category?': c1 == c2})
+                twin['Full-page Overlap'] = t['TF-IDF Similarity']
+                results.append(twin)
         progress.progress(1.0, text="Step 3/3: Full-page overlap done")
     except Exception as e:
         run['warnings'].append(f"Full-page overlap could not be calculated: {e}")
@@ -434,13 +445,13 @@ if run:
         ('New Embeddings Generated', run['new_embeddings']),
     ]
     if results_df is not None:
-        level_counts = results_df['Similarity Level'].value_counts()
-        # Template twins sit below the threshold by definition – keep them out of the score stats
-        above = results_df.loc[results_df['Semantic Similarity'] >= run['settings']['threshold'],
-                               'Semantic Similarity']
-        summary_rows += [('Similar Pairs Found', len(results_df))] + \
+        # Template twins sit below the threshold by definition – keep them out of the levels and score stats
+        is_above = results_df['Semantic Similarity'] >= run['settings']['threshold']
+        above = results_df.loc[is_above, 'Semantic Similarity']
+        level_counts = results_df.loc[is_above, 'Similarity Level'].value_counts()
+        summary_rows += [('Similar Pairs Found (at or above threshold)', len(above))] + \
             [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER] + [
-            ('Pairs At or Above Threshold', len(above)),
+            ('Template Twin Pairs (listed separately)', int((~is_above).sum())),
             ('Average Semantic Similarity (above threshold)', fmt_pct(above.mean())),
             ('Maximum Semantic Similarity (above threshold)', fmt_pct(above.max())),
             ('Minimum Semantic Similarity (above threshold)', fmt_pct(above.min())),
@@ -525,11 +536,16 @@ if run:
             col.metric(label, int(count))
         st.caption("**Same content** – the unique text matches too. "
                    "**Same topic, different wording** – same subject, written differently. "
-                   "**Template twins** – the pages match mainly through blocks they share.")
+                   f"**Template twins** – the pages match mainly through blocks they share, and are at least "
+                   f"{TEMPLATE_TWIN_MIN_SEMANTIC * 100:.0f}% alike in meaning.")
 
     st.subheader("📈 Similarity Level Distribution")
     dist = pd.DataFrame({'Pairs': [int(level_counts.get(l, 0)) for l in LEVEL_ORDER]}, index=LEVEL_ORDER)
-    st.bar_chart(dist[dist['Pairs'] > 0])
+    if dist['Pairs'].any():
+        st.bar_chart(dist[dist['Pairs'] > 0])
+        st.caption("Pairs at or above the threshold. Template twins are counted under **What kind of overlap**.")
+    else:
+        st.caption(f"No pairs at or above {run['settings']['threshold'] * 100:.0f}% – only template twins were found.")
 
     st.subheader("🔝 Top 10 Most Similar Pairs")
     st.caption("\"Semantic Similarity\" compares the unique content; \"Full-page Overlap\" compares the raw text.")

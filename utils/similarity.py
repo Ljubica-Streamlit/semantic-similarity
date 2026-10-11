@@ -90,6 +90,7 @@ def calculate_similarities(df, threshold=0.85, progress_callback=None, block_siz
 # --------------------------------------------------------------- overlap types
 FULL_OVERLAP_HIGH = 0.70     # raw-text word overlap counted as "same words"
 TEMPLATE_TWIN_MIN = 0.80     # raw overlap that makes a pair worth showing on its own
+TEMPLATE_TWIN_MIN_SEMANTIC = 0.60  # below this the pages only share a component (e.g. a form), not a purpose
 MAX_TEMPLATE_TWIN_PAIRS = 5000
 
 

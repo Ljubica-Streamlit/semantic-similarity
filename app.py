@@ -14,8 +14,9 @@ from utils.similarity import (
 )
 from utils import boilerplate
 from utils.tfidf import build_matrix, calculate_tfidf_for_pairs, calculate_tfidf_similarity
+from utils.groups import group_pages, groups_frame, pair_group, DECISIONS, UNGROUPED
 from utils.export import (
-    embeddings_csv, results_csv, summary_csv, excel_workbook, embeddings_frame, results_frame,
+    embeddings_csv, results_csv, groups_csv, summary_csv, excel_workbook, embeddings_frame, results_frame,
     count_over_cell_limit, looks_cut_by_excel, EXCEL_CELL_LIMIT,
 )
 from utils.columns import load_table, detect_columns, column_labels, build_dataframe
@@ -393,18 +394,36 @@ def run_analysis(df):
     if results:
         results_df = pd.DataFrame(results)
         unique_pct = dict(zip(df['URL'].astype(str), df['Unique Content %']))
+        # Levels only judge pairs at or above the threshold – template twins were never scored at a level
         results_df.insert(2, 'Similarity Level', results_df['Semantic Similarity'].apply(
-            lambda s: categorize_similarity(s) if pd.notna(s) else '–'))
+            lambda s: categorize_similarity(s) if pd.notna(s) and s >= similarity_threshold else '–'))
         results_df.insert(3, 'Overlap Type', [
             classify_overlap(r['Semantic Similarity'], r.get('Full-page Overlap'), similarity_threshold)
             for _, r in results_df.iterrows()])
         results_df['Unique Content % 1'] = results_df['URL 1'].map(unique_pct)
         results_df['Unique Content % 2'] = results_df['URL 2'].map(unique_pct)
+        notes = None
         if 'Page Note' in df.columns:
             notes = dict(zip(df['URL'].astype(str), df['Page Note']))
             results_df['Page Note 1'] = results_df['URL 1'].map(notes)
             results_df['Page Note 2'] = results_df['URL 2'].map(notes)
         results_df = results_df.sort_values('Semantic Similarity', ascending=False, na_position='last')
+
+        # Topic groups from pairs at or above the threshold (template twins are a different finding)
+        main = results_df[results_df['Semantic Similarity'] >= similarity_threshold]
+        if len(main):
+            try:
+                emb_by_url = {}
+                for u, e in zip(df['URL'].astype(str), df['Embedding']):
+                    emb_by_url.setdefault(u, e)
+                pages = sorted(set(main['URL 1']) | set(main['URL 2']))
+                membership, weakest = group_pages(pages, [emb_by_url[u] for u in pages], similarity_threshold)
+                results_df.insert(4, 'Group', [pair_group(a, b, membership)
+                                               for a, b in zip(results_df['URL 1'], results_df['URL 2'])])
+                cats = dict(zip(df['URL'].astype(str), df['Category'])) if has_categories else None
+                run['groups_df'] = groups_frame(main, membership, weakest, unique_pct, notes, cats)
+            except Exception as e:
+                run['warnings'].append(f"Topic groups could not be built: {e}")
         run['results_df'] = results_df.reset_index(drop=True)
 
 
@@ -437,6 +456,7 @@ if run:
             st.code(run['trace'])
 
     results_df = run['results_df']
+    groups_df = run.get('groups_df')
     data_sheet = ('Data + Embeddings', embeddings_frame(rdf, has_categories))
 
     summary_rows = [
@@ -452,6 +472,16 @@ if run:
         summary_rows += [('Similar Pairs Found (at or above threshold)', len(above))] + \
             [(label, int(level_counts.get(label, 0))) for label in LEVEL_ORDER] + [
             ('Template Twin Pairs (listed separately)', int((~is_above).sum())),
+        ]
+    if groups_df is not None and len(groups_df):
+        grouped = groups_df['Group'] != UNGROUPED
+        summary_rows += [
+            ('Topic Groups', int(groups_df.loc[grouped, 'Group'].nunique())),
+            ('Pages in Topic Groups', int(grouped.sum())),
+            ('Similar Pages Not in a Group', int((~grouped).sum())),
+        ]
+    if results_df is not None:
+        summary_rows += [
             ('Average Semantic Similarity (above threshold)', fmt_pct(above.mean())),
             ('Maximum Semantic Similarity (above threshold)', fmt_pct(above.max())),
             ('Minimum Semantic Similarity (above threshold)', fmt_pct(above.min())),
@@ -472,7 +502,9 @@ if run:
         st.info(f"💾 Your {n_emb} embeddings are saved in the file below. Upload it again to continue "
                 f"without paying for them twice.")
 
-    sheets = ([('Similarity Results', results_frame(results_df))] if results_df is not None else []) + \
+    has_groups = groups_df is not None and len(groups_df) > 0
+    sheets = ([('Groups', results_frame(groups_df))] if has_groups else []) + \
+        ([('Similarity Results', results_frame(results_df))] if results_df is not None else []) + \
         [summary_sheet, data_sheet]
     excel_ok = False
     if n_emb or results_df is not None:
@@ -480,7 +512,7 @@ if run:
             label = "📥 Download Results (Excel)" if results_df is not None else \
                 f"📥 Download Embeddings (Excel, {n_emb}/{len(rdf)} pages)"
             st.download_button(
-                label=label, data=excel_workbook(sheets),
+                label=label, data=excel_workbook(sheets, dropdowns={'Groups': {'Decision': DECISIONS}}),
                 file_name=f"semantic_similarity_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary", width="stretch", key="dl_excel",
@@ -498,7 +530,12 @@ if run:
 
     # CSV versions: tucked away normally, shown openly if Excel failed
     with st.expander("Prefer CSV files?", expanded=not excel_ok):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
+        if has_groups:
+            with c4:
+                st.download_button("Groups CSV", data=groups_csv(groups_df),
+                                   file_name=f"similarity_groups_{ts}.csv", mime="text/csv",
+                                   width="stretch", key="dl_groups")
         with c1:
             if n_emb:
                 st.download_button("Data + Embeddings CSV", data=embeddings_csv(rdf, has_categories),
@@ -546,6 +583,22 @@ if run:
         st.caption("Pairs at or above the threshold. Template twins are counted under **What kind of overlap**.")
     else:
         st.caption(f"No pairs at or above {run['settings']['threshold'] * 100:.0f}% – only template twins were found.")
+
+    if has_groups:
+        st.subheader("🗂️ Topic Groups")
+        grouped = groups_df['Group'] != UNGROUPED
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Groups", int(groups_df.loc[grouped, 'Group'].nunique()))
+        g2.metric("Pages in groups", int(grouped.sum()))
+        g3.metric("Similar pages not in a group", int((~grouped).sum()))
+        st.caption(f"Every page in a group is at least {run['settings']['threshold'] * 100:.0f}% similar to every "
+                   f"other page in it. *Weakest Link* is the lowest score inside the group. Pages that match "
+                   f"something but don't fit a whole group are listed as *Ungrouped*. Record your verdicts in the "
+                   f"**Decision** and **Notes** columns of the Groups sheet.")
+        shown = groups_df.drop(columns=['Decision', 'Notes']).copy()
+        for col in ('Weakest Link', 'Closest Match Score'):
+            shown[col] = shown[col].apply(fmt_pct)
+        st.dataframe(shown, width="stretch", hide_index=True, height=400)
 
     st.subheader("🔝 Top 10 Most Similar Pairs")
     st.caption("\"Semantic Similarity\" compares the unique content; \"Full-page Overlap\" compares the raw text.")

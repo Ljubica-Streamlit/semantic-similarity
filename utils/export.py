@@ -47,7 +47,14 @@ def embeddings_csv(df, has_categories):
 
 def results_csv(results_df):
     """Results only hold URLs, labels and numbers, so the formula guard can't alter re-uploaded content."""
-    out = results_frame(results_df)
+    return _report_csv(results_frame(results_df))
+
+
+def groups_csv(groups_df):
+    return _report_csv(results_frame(groups_df))
+
+
+def _report_csv(out):
     for col in out.columns:
         if not pd.api.types.is_numeric_dtype(out[col]):
             out[col] = out[col].map(csv_safe)
@@ -94,10 +101,13 @@ def embeddings_frame(df, has_categories):
     return out
 
 
-_PERCENT_COLUMNS = ('Semantic Similarity', 'TF-IDF Similarity', 'Full-page Overlap')
+# Scores are kept as 0–1 internally and shown as percentages in every export
+_PERCENT_COLUMNS = ('Semantic Similarity', 'TF-IDF Similarity', 'Full-page Overlap', 'Weakest Link',
+                    'Closest Match Score')
 
 
 def results_frame(results_df):
+    """Export view of a results or groups table – shared by Excel and CSV so they can't disagree."""
     out = results_df.copy()
     for col in _PERCENT_COLUMNS:
         if col in out.columns:
@@ -105,8 +115,10 @@ def results_frame(results_df):
     return out.rename(columns={c: f"{c} (%)" for c in _PERCENT_COLUMNS})
 
 
-def excel_workbook(sheets):
+def excel_workbook(sheets, dropdowns=None):
     """sheets: list of (sheet_name, DataFrame). Returns .xlsx bytes.
+
+    dropdowns: {sheet_name: {column_name: [options]}} adds a pick list to that column.
 
     Control characters are removed and over-long cells are trimmed to Excel's
     32,767-character limit, so building the file cannot fail on page content.
@@ -114,6 +126,8 @@ def excel_workbook(sheets):
     any characters – the file is meant to be re-uploaded unchanged.
     """
     from openpyxl.styles import Font
+    from openpyxl.worksheet.datavalidation import DataValidation
+    dropdowns = dropdowns or {}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         for name, frame in sheets:
@@ -134,4 +148,11 @@ def excel_workbook(sheets):
                 sample = [str(col)] + [str(v) for v in safe[col].head(50).tolist()]
                 width = min(max(len(s) for s in sample) + 2, 60)
                 ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+            for col, options in dropdowns.get(name, {}).items():
+                if col in safe.columns and len(safe):
+                    letter = ws.cell(row=1, column=list(safe.columns).index(col) + 1).column_letter
+                    dv = DataValidation(type='list', formula1='"' + ','.join(options) + '"', allow_blank=True)
+                    dv.add(f"{letter}2:{letter}{len(safe) + 1}")
+                    ws.add_data_validation(dv)
+                    ws.column_dimensions[letter].width = max(ws.column_dimensions[letter].width or 0, 14)
     return buf.getvalue()

@@ -44,14 +44,18 @@ def _batches(todo, token_counts):
         yield batch
 
 
+def price_per_million(model=MODEL):
+    """OpenAI list price in USD per 1M input tokens."""
+    return 0.13 if 'large' in model else 0.02
+
+
 def estimate_cost(texts, model=MODEL):
     """Rough OpenAI cost estimate from the actual text length."""
     if _ENC is not None:
         tokens = sum(min(len(_ENC.encode(str(t), disallowed_special=())), MAX_TOKENS) for t in texts)
     else:
         tokens = sum(min(len(str(t)) // CHARS_PER_TOKEN, MAX_TOKENS) for t in texts)
-    price = 0.13 if 'large' in model else 0.02  # per 1M tokens
-    return tokens / 1_000_000 * price
+    return tokens / 1_000_000 * price_per_million(model)
 
 
 def _is_fatal(error_str):
@@ -70,14 +74,15 @@ def generate_embeddings(texts, urls, api_key, progress_callback=None, existing=N
     todo = [i for i in range(n) if not (isinstance(embeddings[i], np.ndarray) and embeddings[i].size > 0)]
     skipped_rows = []
     new_count = 0
-    trimmed = 0
+    trimmed = []  # URLs of pages cut to the model's limit
 
     # Only the rows that will actually be sent
     prepared, token_counts = {}, {}
     for i in todo:
         text = str(texts[i]).strip() or "(empty page)"
         text, was_trimmed, tokens = trim_to_limit(text)
-        trimmed += int(was_trimmed)
+        if was_trimmed:
+            trimmed.append(urls[i])
         prepared[i] = f"page content: {text}"
         token_counts[i] = tokens + 3  # the prefix
 

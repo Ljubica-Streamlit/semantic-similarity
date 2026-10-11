@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from utils.embeddings import generate_embeddings, estimate_cost, MODEL, MAX_TOKENS
+from utils.embeddings import generate_embeddings, estimate_cost, price_per_million, MODEL, MAX_TOKENS
 from utils.similarity import (
     calculate_similarities, count_pairs_at, calculate_cosine_similarity, categorize_similarity, classify_overlap,
     SIMILARITY_LEVELS, LEVEL_ORDER, TEMPLATE_TWIN_MIN, TEMPLATE_TWIN_MIN_SEMANTIC, MAX_TEMPLATE_TWIN_PAIRS,
@@ -65,6 +65,7 @@ with st.sidebar:
         st.success("✅ API Key provided")
     else:
         st.info("Enter your OpenAI API key (not needed if your file already has embeddings)")
+    st.caption(f"Model: `{MODEL}` (OpenAI) · ${price_per_million():.2f} per 1M tokens – about 1,000 pages")
 
     st.markdown("---")
     st.header("📊 Analysis Options")
@@ -324,8 +325,11 @@ def run_analysis(df):
                                     for m, e, s in zip(was_missing, df['Embedding'], settings)]
         run['new_embeddings'] = emb['new_count']
         if emb.get('trimmed'):
-            run['warnings'].append(f"{emb['trimmed']} pages were longer than the model's limit and were trimmed "
-                                   f"to their first ~{MAX_TOKENS:,} tokens.")
+            trimmed = emb['trimmed']
+            run['warnings'].append(
+                ("1 page was" if len(trimmed) == 1 else f"{len(trimmed)} pages were") +
+                f" longer than the model's limit, so only the first ~{MAX_TOKENS:,} tokens were compared: " +
+                ", ".join(trimmed[:20]) + (" ..." if len(trimmed) > 20 else ""))
         if emb['skipped_rows']:
             run['warnings'].append(
                 f"{len(emb['skipped_rows'])} pages could not be embedded and were left out: " +

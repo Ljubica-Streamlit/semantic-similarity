@@ -35,29 +35,53 @@ def _is_valid(x):
     return isinstance(x, np.ndarray) and x.size > 0
 
 
+def _normalised(df):
+    """Rows with a valid embedding of the most common length, and their L2-normalised matrix."""
+    mask = df['Embedding'].apply(_is_valid)
+    valid = df[mask].reset_index(drop=True)
+    if len(valid) < 2:
+        return valid, None
+
+    # Keep only embeddings with the most common dimension (guards against mixed models)
+    dims = valid['Embedding'].apply(len)
+    main_dim = dims.mode()[0]
+    valid = valid[dims == main_dim].reset_index(drop=True)
+    if len(valid) < 2:
+        return valid, None
+
+    matrix = np.vstack(valid['Embedding'].values).astype(np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return valid, matrix / norms
+
+
+def count_pairs_at(df, cutoffs, block_size=500):
+    """Number of page pairs at or above each cutoff – shows what another threshold would give."""
+    valid, matrix = _normalised(df)
+    counts = {c: 0 for c in cutoffs}
+    if matrix is None:
+        return counts
+    n = len(valid)
+    cols = np.arange(n)
+    for start in range(0, n, block_size):
+        end = min(start + block_size, n)
+        sims = matrix[start:end] @ matrix.T
+        upper = cols[None, :] > np.arange(start, end)[:, None]  # each pair once
+        for c in cutoffs:
+            counts[c] += int(np.count_nonzero((sims >= c) & upper))
+    return counts
+
+
 def calculate_similarities(df, threshold=0.85, progress_callback=None, block_size=500):
     """Pairwise cosine similarity for all rows with a valid embedding.
 
     Vectorised in blocks, so 5,000 pages takes seconds instead of hours.
     Rows whose embedding is missing or has a different length are skipped.
     """
-    mask = df['Embedding'].apply(_is_valid)
-    valid = df[mask].reset_index(drop=True)
-    if len(valid) < 2:
+    valid, matrix = _normalised(df)
+    if matrix is None:
         return []
-
-    # Keep only embeddings with the most common dimension (guards against mixed models)
-    dims = valid['Embedding'].apply(len)
-    main_dim = dims.mode()[0]
-    valid = valid[dims == main_dim].reset_index(drop=True)
     n = len(valid)
-    if n < 2:
-        return []
-
-    matrix = np.vstack(valid['Embedding'].values).astype(np.float32)
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    matrix = matrix / norms
 
     urls = valid['URL'].astype(str).tolist()
     has_cat = 'Category' in valid.columns

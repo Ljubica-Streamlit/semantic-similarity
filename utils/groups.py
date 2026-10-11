@@ -5,20 +5,26 @@ similar to EVERY page already in it. Plain "connect everything above the
 threshold" chains A~B~C into one group even when A and C are unrelated – on a
 real 218-page site that fused 31 pages into one group at 88%.
 
+A page can be close to a page in another group without fitting that whole
+group. Rather than moving pages around (tested on that site: it barely changed
+anything), the sheet says so in "Also Close To Group".
+
 Only the embedding scores are used – no URL or folder rules.
 """
 import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage
 
-UNGROUPED = 'Ungrouped'
+from utils.similarity import categorize_similarity
+
 DECISIONS = ['Keep', 'Merge', 'Redirect', 'Noindex', 'Rewrite', 'Leave as is']
 
 
 def group_pages(urls, vectors, threshold):
-    """Return ({url: group_no}, {group_no: weakest_link}) for groups of 2+ pages.
+    """Return ({url: group_no}, {group_no: {'weakest': x, 'best': y}}) for groups of 2+ pages.
 
-    Groups are numbered 1..k, largest first, then tightest first.
+    Groups are numbered 1..k by their strongest pair (likely duplicates first),
+    then by their weakest link.
     """
     if len(urls) < 2:
         return {}, {}
@@ -36,23 +42,24 @@ def group_pages(urls, vectors, threshold):
         idx = np.nonzero(labels == label)[0]
         if len(idx) < 2:
             continue
-        sub = sims[np.ix_(idx, idx)]
-        weakest = float(sub[np.triu_indices(len(idx), 1)].min())
-        clusters.append((idx, weakest))
-    clusters.sort(key=lambda c: (-len(c[0]), -c[1]))
+        inner = sims[np.ix_(idx, idx)][np.triu_indices(len(idx), 1)]
+        clusters.append((idx, float(inner.min()), float(inner.max())))
+    # Fixed tie-break on the first URL keeps numbering stable between runs
+    clusters.sort(key=lambda c: (-c[2], -c[1], urls[c[0][0]]))
 
-    membership, weakest_link = {}, {}
-    for number, (idx, weakest) in enumerate(clusters, start=1):
-        weakest_link[number] = weakest
+    membership, stats = {}, {}
+    for number, (idx, weakest, best) in enumerate(clusters, start=1):
+        stats[number] = {'weakest': weakest, 'best': best}
         for i in idx:
             membership[urls[i]] = number
-    return membership, weakest_link
+    return membership, stats
 
 
-def groups_frame(pairs, membership, weakest_link, unique_pct=None, notes=None, categories=None):
+def groups_frame(pairs, membership, stats, unique_pct=None, notes=None, categories=None):
     """One row per page that has at least one similar pair, sorted by group.
 
     `pairs` has URL 1, URL 2 and Semantic Similarity (pairs at or above the threshold only).
+    Pages that match something but don't fit a whole group come last, with an empty Group.
     """
     best, counts = {}, {}
     for u1, u2, score in zip(pairs['URL 1'], pairs['URL 2'], pairs['Semantic Similarity']):
@@ -65,15 +72,24 @@ def groups_frame(pairs, membership, weakest_link, unique_pct=None, notes=None, c
     rows = []
     for page, (match, score) in best.items():
         group = membership.get(page)
+        info = stats.get(group, {})
+        match_group = membership.get(match)
         row = {
-            'Group': group if group is not None else UNGROUPED,
-            'Pages in Group': sizes.get(group, np.nan),
-            'Weakest Link': weakest_link.get(group, np.nan),
+            'Group': group,
+            'Pages in Group': sizes.get(group),
+            'Group Strength': categorize_similarity(info['weakest']) if info else None,
+            'Best Pair': info.get('best', np.nan),
+            'Weakest Link': info.get('weakest', np.nan),
             'URL': page,
         }
         if categories is not None:
             row['Category'] = categories.get(page)
-        row.update({'Closest Match': match, 'Closest Match Score': score, 'Similar Pages': counts[page]})
+        row.update({
+            'Closest Match': match,
+            'Closest Match Score': score,
+            'Also Close To Group': match_group if match_group is not None and match_group != group else None,
+            'Similar Pages': counts[page],
+        })
         if unique_pct is not None:
             row['Unique Content %'] = unique_pct.get(page)
         if notes is not None:
@@ -84,13 +100,19 @@ def groups_frame(pairs, membership, weakest_link, unique_pct=None, notes=None, c
     out = pd.DataFrame(rows)
     if out.empty:
         return out
+    # Whole numbers stay whole (and empty) in Excel and CSV instead of turning into 8.0
+    for col in ('Group', 'Pages in Group', 'Also Close To Group', 'Similar Pages'):
+        out[col] = out[col].astype('Int64')
     # Groups in number order, ungrouped pages last; inside a group the most connected page first
-    out['_order'] = out['Group'].map(lambda g: g if g != UNGROUPED else float('inf'))
-    out = out.sort_values(['_order', 'Similar Pages', 'Closest Match Score'], ascending=[True, False, False])
-    return out.drop(columns='_order').reset_index(drop=True)
+    out = out.sort_values(['Group', 'Similar Pages', 'Closest Match Score', 'URL'],
+                          ascending=[True, False, False, True], na_position='last')
+    return out.reset_index(drop=True)
 
 
-def pair_group(u1, u2, membership):
-    """Group number when both pages of a pair are in the same group, else ''."""
-    g1, g2 = membership.get(u1), membership.get(u2)
-    return g1 if g1 is not None and g1 == g2 else ''
+def pair_groups(pairs, membership):
+    """Group number for each pair when both pages are in the same group, else empty."""
+    values = []
+    for u1, u2 in zip(pairs['URL 1'], pairs['URL 2']):
+        g1, g2 = membership.get(u1), membership.get(u2)
+        values.append(g1 if g1 is not None and g1 == g2 else None)
+    return pd.array(values, dtype='Int64')

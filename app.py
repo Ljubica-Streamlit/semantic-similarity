@@ -9,12 +9,12 @@ import streamlit as st
 
 from utils.embeddings import generate_embeddings, estimate_cost, MODEL, MAX_TOKENS
 from utils.similarity import (
-    calculate_similarities, calculate_cosine_similarity, categorize_similarity, classify_overlap,
+    calculate_similarities, count_pairs_at, calculate_cosine_similarity, categorize_similarity, classify_overlap,
     SIMILARITY_LEVELS, LEVEL_ORDER, TEMPLATE_TWIN_MIN, TEMPLATE_TWIN_MIN_SEMANTIC, MAX_TEMPLATE_TWIN_PAIRS,
 )
 from utils import boilerplate
 from utils.tfidf import build_matrix, calculate_tfidf_for_pairs, calculate_tfidf_similarity
-from utils.groups import group_pages, groups_frame, pair_group, DECISIONS, UNGROUPED
+from utils.groups import group_pages, groups_frame, pair_groups, DECISIONS
 from utils.export import (
     embeddings_csv, results_csv, groups_csv, summary_csv, excel_workbook, embeddings_frame, results_frame,
     count_over_cell_limit, looks_cut_by_excel, EXCEL_CELL_LIMIT,
@@ -31,6 +31,9 @@ Find duplicate, near-duplicate and overlapping content across your site.
 
 
 # ---------------------------------------------------------------- helpers
+THRESHOLD_STEPS = (0.80, 0.85, 0.88, 0.90, 0.95, 0.98)  # rows of the 'pairs at each threshold' table
+
+
 def parse_embedding(x):
     """Return np.ndarray or None. Never raises."""
     if isinstance(x, np.ndarray):
@@ -66,7 +69,7 @@ with st.sidebar:
     st.header("📊 Analysis Options")
 
     similarity_threshold = st.slider(
-        "Semantic Similarity Threshold (%)", min_value=70, max_value=99, value=85, step=1,
+        "Semantic Similarity Threshold (%)", min_value=70, max_value=99, value=88, step=1,
         help="Only show pairs whose unique content is at least this similar") / 100
 
     strip_boilerplate = st.checkbox(
@@ -343,6 +346,11 @@ def run_analysis(df):
         run['errors'].append(f"Similarity calculation failed: {e}")
         run['trace'] = traceback.format_exc()
         return
+    try:
+        steps = sorted(set(THRESHOLD_STEPS) | {similarity_threshold})
+        run['pair_counts'] = count_pairs_at(df, steps)
+    except Exception as e:
+        run['warnings'].append(f"Pairs per threshold could not be counted: {e}")
 
     # Step 3 – full-page overlap on the raw text (free, no API)
     try:
@@ -417,11 +425,10 @@ def run_analysis(df):
                 for u, e in zip(df['URL'].astype(str), df['Embedding']):
                     emb_by_url.setdefault(u, e)
                 pages = sorted(set(main['URL 1']) | set(main['URL 2']))
-                membership, weakest = group_pages(pages, [emb_by_url[u] for u in pages], similarity_threshold)
-                results_df.insert(4, 'Group', [pair_group(a, b, membership)
-                                               for a, b in zip(results_df['URL 1'], results_df['URL 2'])])
+                membership, group_stats = group_pages(pages, [emb_by_url[u] for u in pages], similarity_threshold)
+                results_df.insert(4, 'Group', pair_groups(results_df, membership))
                 cats = dict(zip(df['URL'].astype(str), df['Category'])) if has_categories else None
-                run['groups_df'] = groups_frame(main, membership, weakest, unique_pct, notes, cats)
+                run['groups_df'] = groups_frame(main, membership, group_stats, unique_pct, notes, cats)
             except Exception as e:
                 run['warnings'].append(f"Topic groups could not be built: {e}")
         run['results_df'] = results_df.reset_index(drop=True)
@@ -474,7 +481,7 @@ if run:
             ('Template Twin Pairs (listed separately)', int((~is_above).sum())),
         ]
     if groups_df is not None and len(groups_df):
-        grouped = groups_df['Group'] != UNGROUPED
+        grouped = groups_df['Group'].notna()
         summary_rows += [
             ('Topic Groups', int(groups_df.loc[grouped, 'Group'].nunique())),
             ('Pages in Topic Groups', int(grouped.sum())),
@@ -488,6 +495,7 @@ if run:
         ]
     summary_rows += [
         ('Similarity Threshold Used', f"{run['settings']['threshold'] * 100:.0f}%"),
+    ] + [(f"Pairs at {c * 100:.0f}% or above", n) for c, n in run.get('pair_counts', {}).items()] + [
         ('Repeated Blocks Removed', 'Yes' if run['settings']['boilerplate'] else 'No'),
         ('Removal Threshold', f"{run['settings']['boilerplate_threshold'] * 100:.0f}% of pages"
          if run['settings']['boilerplate'] else 'n/a'),
@@ -515,7 +523,7 @@ if run:
                 label=label, data=excel_workbook(sheets, dropdowns={'Groups': {'Decision': DECISIONS}}),
                 file_name=f"semantic_similarity_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary", width="stretch", key="dl_excel",
+                type="primary", width="stretch", key="dl_excel", on_click="ignore",
                 help="One file: " + ", ".join(name for name, _ in sheets) + ". "
                      "Re-upload it later to reuse the embeddings.")
             st.caption("Sheets: " + " · ".join(name for name, _ in sheets))
@@ -535,21 +543,21 @@ if run:
             with c4:
                 st.download_button("Groups CSV", data=groups_csv(groups_df),
                                    file_name=f"similarity_groups_{ts}.csv", mime="text/csv",
-                                   width="stretch", key="dl_groups")
+                                   width="stretch", key="dl_groups", on_click="ignore")
         with c1:
             if n_emb:
                 st.download_button("Data + Embeddings CSV", data=embeddings_csv(rdf, has_categories),
                                    file_name=f"embeddings_{ts}.csv", mime="text/csv",
-                                   width="stretch", key="dl_embeddings")
+                                   width="stretch", key="dl_embeddings", on_click="ignore")
         if results_df is not None:
             with c2:
                 st.download_button("Similarity Results CSV", data=results_csv(results_df),
                                    file_name=f"similarity_results_{ts}.csv", mime="text/csv",
-                                   width="stretch", key="dl_results")
+                                   width="stretch", key="dl_results", on_click="ignore")
             with c3:
                 st.download_button("Summary CSV", data=summary_csv(summary_rows),
                                    file_name=f"similarity_summary_{ts}.csv", mime="text/csv",
-                                   width="stretch", key="dl_summary")
+                                   width="stretch", key="dl_summary", on_click="ignore")
 
     if results_df is None:
         if not run['errors']:
@@ -584,19 +592,30 @@ if run:
     else:
         st.caption(f"No pairs at or above {run['settings']['threshold'] * 100:.0f}% – only template twins were found.")
 
+    if run.get('pair_counts'):
+        st.subheader("🎚️ Pairs at Each Threshold")
+        current = run['settings']['threshold']
+        st.dataframe(pd.DataFrame([{'Threshold': f"{c * 100:.0f}%" + ("  ← used" if abs(c - current) < 1e-9 else ""),
+                                    'Similar pairs': n} for c, n in run['pair_counts'].items()]),
+                     hide_index=True)
+        st.caption("Template twins not included. Change the threshold in the sidebar and run again to see a "
+                   "different cut – existing embeddings are reused, so it costs nothing.")
+
     if has_groups:
         st.subheader("🗂️ Topic Groups")
-        grouped = groups_df['Group'] != UNGROUPED
+        grouped = groups_df['Group'].notna()
         g1, g2, g3 = st.columns(3)
         g1.metric("Groups", int(groups_df.loc[grouped, 'Group'].nunique()))
         g2.metric("Pages in groups", int(grouped.sum()))
         g3.metric("Similar pages not in a group", int((~grouped).sum()))
         st.caption(f"Every page in a group is at least {run['settings']['threshold'] * 100:.0f}% similar to every "
-                   f"other page in it. *Weakest Link* is the lowest score inside the group. Pages that match "
-                   f"something but don't fit a whole group are listed as *Ungrouped*. Record your verdicts in the "
-                   f"**Decision** and **Notes** columns of the Groups sheet.")
+                   f"other page in it. Groups are sorted by *Best Pair* (their closest two pages), so likely "
+                   f"duplicates come first; *Group Strength* rates the *Weakest Link*. *Also Close To Group* "
+                   f"flags a page whose closest match sits in another group it doesn't fully fit. Pages with no "
+                   f"Group match something but no whole group. Record verdicts in **Decision** and **Notes** in "
+                   f"the Groups sheet.")
         shown = groups_df.drop(columns=['Decision', 'Notes']).copy()
-        for col in ('Weakest Link', 'Closest Match Score'):
+        for col in ('Best Pair', 'Weakest Link', 'Closest Match Score'):
             shown[col] = shown[col].apply(fmt_pct)
         st.dataframe(shown, width="stretch", hide_index=True, height=400)
 

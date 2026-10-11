@@ -102,8 +102,8 @@ def embeddings_frame(df, has_categories):
 
 
 # Scores are kept as 0–1 internally and shown as percentages in every export
-_PERCENT_COLUMNS = ('Semantic Similarity', 'TF-IDF Similarity', 'Full-page Overlap', 'Weakest Link',
-                    'Closest Match Score')
+_PERCENT_COLUMNS = ('Semantic Similarity', 'TF-IDF Similarity', 'Full-page Overlap', 'Best Pair',
+                    'Weakest Link', 'Closest Match Score')
 
 
 def results_frame(results_df):

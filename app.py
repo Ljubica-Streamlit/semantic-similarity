@@ -28,7 +28,8 @@ st.set_page_config(page_title="Semantic Similarity Analyzer: Content Cannibaliza
 st.title("🔍 Semantic Similarity Analyzer")
 st.markdown("""
 Measure how semantically similar your pages are using AI embeddings.
-Find duplicate, near-duplicate and overlapping content across your site. Ideal for content cannibalization audits.
+Find duplicate, near-duplicate and overlapping content across your site. Combine it with your keyword
+cannibalization audit to decide which pages to merge, redirect or keep.
 """)
 
 

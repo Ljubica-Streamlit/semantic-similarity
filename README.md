@@ -2,6 +2,8 @@
 
 A Streamlit app that measures semantic similarity between web pages using AI embeddings – find duplicate, near-duplicate and overlapping content, grouped into topics you can act on.
 
+**[Open the app](https://semantic-similarity-ljubica.streamlit.app/)** · [About this tool](https://addonist.com/tools/semantic-similarity-analysis/)
+
 ## Features
 
 - 🔍 **AI-Powered Analysis** - Uses OpenAI embeddings for semantic similarity
@@ -130,7 +132,7 @@ from different settings aren't comparable.
 
 ## Support
 
-For issues or questions, create an issue on GitHub.
+Questions or feedback? [Message me on LinkedIn](https://www.linkedin.com/in/ljubica-popovic-lp/), or create an issue on GitHub.
 
 ## Author
 

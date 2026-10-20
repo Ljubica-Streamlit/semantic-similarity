@@ -2,6 +2,8 @@
 
 A Streamlit app that measures semantic similarity between web pages using AI embeddings – find duplicate, near-duplicate and overlapping content, grouped into topics you can act on.
 
+Built for **content cannibalization audits**: it finds pages that compete on the same content, so you can decide what to merge, redirect or keep. To confirm which pages compete in search, check them in Google Search Console.
+
 **[Open the app](https://semantic-similarity-ljubica.streamlit.app/)** · [About this tool](https://addonist.com/tools/semantic-similarity-analysis/)
 
 ## Features

@@ -33,6 +33,16 @@ Find duplicate, near-duplicate and overlapping content across your site.
 
 # ---------------------------------------------------------------- helpers
 THRESHOLD_STEPS = (0.80, 0.85, 0.88, 0.90, 0.95, 0.98)  # rows of the 'pairs at each threshold' table
+ABOUT_URL = "https://addonist.com/tools/semantic-similarity-analysis/"
+FEEDBACK_URL = "https://www.linkedin.com/in/ljubica-popovic-lp/"
+CODE_URL = "https://github.com/Ljubica-Streamlit/semantic-similarity"
+FOOTER = (f"Built by Ljubica Popovic · [About this tool]({ABOUT_URL}) · "
+          f"Questions or feedback? [Message me on LinkedIn]({FEEDBACK_URL}) · [Code on GitHub]({CODE_URL})")
+
+
+def footer():
+    st.markdown("---")
+    st.caption(FOOTER)
 
 
 def parse_embedding(x):
@@ -90,6 +100,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.info("🔒 **Privacy:** Your data and API key are processed in-memory only and never stored on our servers.")
+    st.caption(f"Questions or feedback? [Message me on LinkedIn]({FEEDBACK_URL}) · [About this tool]({ABOUT_URL})")
 
 
 # ---------------------------------------------------------------- upload
@@ -111,9 +122,7 @@ automatically too: a **Category** column, and an **Embedding** column from a pre
 You'll need an OpenAI API key ([get one here](https://platform.openai.com/api-keys)) –
 about **$0.02 per 1,000 pages**.
 """)
-    st.markdown("---")
-    st.markdown("<div style='text-align:center;color:#666'>Built with Streamlit • Powered by OpenAI • "
-                "Your data is never stored</div>", unsafe_allow_html=True)
+    footer()
     st.stop()
 
 # Reset stored results when a different file is uploaded
@@ -729,6 +738,4 @@ if run:
 
     st.success("✅ Analysis complete! Download your results above.")
 
-st.markdown("---")
-st.markdown("<div style='text-align:center;color:#666'>Built with Streamlit • Powered by OpenAI • "
-            "Your data is never stored</div>", unsafe_allow_html=True)
+footer()

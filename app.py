@@ -223,34 +223,79 @@ settings_label = (f"model={MODEL}; boilerplate="
 embedding_col = 'Embedding' if 'Embedding' in df.columns else None
 df['Embedding'] = df['Embedding'].apply(parse_embedding) if embedding_col else [None] * len(df)
 
-# Embeddings made with other settings would give quietly wrong scores – regenerate them
-mismatched_settings, mismatched_count = set(), 0
-if 'Embedding Settings' in df.columns:
-    previous = df['Embedding Settings'].fillna('').astype(str).str.strip()
-    stale = df['Embedding'].apply(lambda e: isinstance(e, np.ndarray)) & (previous != '') & (previous != settings_label)
-    mismatched_settings = set(previous[stale])
-    mismatched_count = int(stale.sum())
-    df['Embedding'] = [None if s else e for e, s in zip(df['Embedding'], stale)]
+# An embedding depends only on the model, the token cap and the exact text sent. The removal setting matters
+# only through the text it produces – so an embedding is reused whenever that text is identical.
+EMBEDDING_SETTINGS = f"model={MODEL}; max_tokens={MAX_TOKENS}"
+
+
+def embedding_settings(label):
+    """The parts of a settings label that change an embedding (everything except the removal setting)."""
+    return '; '.join(p for p in str(label).split('; ') if not p.startswith('boilerplate='))
+
+
+def text_under(label):
+    """Each page's embedded text under the removal setting in `label`, or None if it can't be rebuilt."""
+    removal = next((p for p in str(label).split('; ') if p.startswith('boilerplate=')), None)
+    if removal == 'boilerplate=off':
+        return list(raw_texts)
+    if removal and removal.startswith('boilerplate=on@') and removal.endswith('%'):
+        try:
+            share = int(removal[len('boilerplate=on@'):-1]) / 100
+        except ValueError:
+            return None
+        return boilerplate.analyse(raw_texts, threshold=share)[0]
+    return None
 
 
 def cache_key(url, text):
-    """An embedding is only reusable for the same page text (and, by its cache bucket, the same settings)."""
+    """An embedding is reusable for the same page and the same text (and the same embedding settings)."""
     return url, hashlib.md5(str(text).encode('utf-8')).hexdigest()
 
 
-# Embeddings already paid for earlier in this session (e.g. before changing the threshold) are reused.
-# One bucket per embedding settings; only the two most recent are kept to stay within free-hosting memory.
-EMB_CACHE_SETTINGS = 2
-emb_buckets = st.session_state.setdefault('emb_cache', {})
-emb_cache = emb_buckets.get(settings_label, {})
+# Embeddings in the file that were made with a different label: keep them when only the removal setting
+# differs and it produced the same text; otherwise they'd give quietly wrong scores, so regenerate them.
+mismatched_settings, mismatched_count, file_reused_count = set(), 0, 0
+if 'Embedding Settings' in df.columns:
+    previous = df['Embedding Settings'].fillna('').astype(str).str.strip().tolist()
+    has_emb = [isinstance(e, np.ndarray) for e in df['Embedding']]
+    rebuilt = {}
+    keep_embedding, labels_now = [], []
+    for i, (lab, has, clean) in enumerate(zip(previous, has_emb, df['Clean Content'])):
+        if not has or not lab or lab == settings_label:
+            keep_embedding.append(True)
+            labels_now.append(lab)
+            continue
+        same_text = False
+        if embedding_settings(lab) == EMBEDDING_SETTINGS:
+            if lab not in rebuilt:
+                rebuilt[lab] = text_under(lab)
+            old_texts = rebuilt[lab]
+            same_text = old_texts is not None and old_texts[i] == clean
+        if same_text:
+            file_reused_count += 1
+            labels_now.append(settings_label)  # valid under the current settings too
+        else:
+            mismatched_settings.add(lab)
+            mismatched_count += 1
+            labels_now.append(lab)
+        keep_embedding.append(same_text)
+    df['Embedding'] = [e if keep else None for e, keep in zip(df['Embedding'], keep_embedding)]
+    df['Embedding Settings'] = labels_now
+
+# Embeddings already paid for earlier in this session (e.g. before changing the threshold or the removal
+# setting) are reused when the page text is identical. Capped at about two versions of each page's text
+# to stay within free-hosting memory.
+emb_cache = st.session_state.setdefault('emb_cache', {}).setdefault(EMBEDDING_SETTINGS, {})
 reused_count = 0
 if emb_cache:
     filled, labels_now = [], []
     old_labels = df['Embedding Settings'].fillna('').astype(str).tolist() \
         if 'Embedding Settings' in df.columns else [''] * len(df)
     for u, t, e, lab in zip(df['URL'].astype(str), df['Clean Content'], df['Embedding'], old_labels):
-        cached = None if isinstance(e, np.ndarray) else emb_cache.get(cache_key(u, t))
+        key = cache_key(u, t)
+        cached = None if isinstance(e, np.ndarray) else emb_cache.get(key)
         if cached is not None:
+            emb_cache[key] = emb_cache.pop(key)  # recently used – keep it
             e, lab = cached, settings_label
             reused_count += 1
         filled.append(e)
@@ -274,15 +319,21 @@ if duplicate_urls:
     st.warning(f"⚠️ {duplicate_urls} duplicate URLs found in the file – they will be compared like separate pages.")
 if mismatched_count:
     st.warning(f"⚠️ {mismatched_count} embeddings in this file were made with different settings "
-               f"({'; '.join(sorted(mismatched_settings))}) and can't be compared with the current ones "
-               f"({settings_label}). "
+               f"({'; '.join(sorted(mismatched_settings))}) that change the text compared, so they can't be "
+               f"compared with the current ones ({settings_label}). "
                + ("They were already generated again earlier in this session, so this costs nothing. "
                   if reused_count >= mismatched_count else "They will be generated again. ")
                + "To use the file's own embeddings instead, match the settings in the sidebar.")
-elif reused_count:
-    st.info(f"♻️ {reused_count} embeddings from your earlier run in this session are reused – no new cost"
-            + (f", {missing_count} still to generate." if missing_count else "."))
-elif embedding_col and 0 < existing_count < len(df):
+if file_reused_count or reused_count:
+    parts = []
+    if file_reused_count:
+        parts.append(f"{file_reused_count} from your file were made with another removal setting, but the page "
+                     f"text is identical")
+    if reused_count:
+        parts.append(f"{reused_count} from your earlier run in this session")
+    st.info(f"♻️ Embeddings reused – no new cost: {'; '.join(parts)}"
+            + (f". {missing_count} still to generate." if missing_count else "."))
+if embedding_col and 0 < existing_count < len(df) and not (mismatched_count or file_reused_count or reused_count):
     st.info(f"ℹ️ {missing_count} rows have no embedding – only those will be generated.")
 if cut_by_excel:
     st.warning(f"⚠️ {cut_by_excel} pages were cut to Excel's {EXCEL_CELL_LIMIT:,}-character cell limit in an "
@@ -357,13 +408,11 @@ def run_analysis(df):
         df['Embedding Settings'] = [settings_label if m and isinstance(e, np.ndarray) else s
                                     for m, e, s in zip(was_missing, df['Embedding'], settings)]
         # Keep what was paid for, even if the run stopped early, so running again doesn't pay twice
-        bucket = emb_buckets.pop(settings_label, {})
         for m, u, t, e in zip(was_missing, df['URL'].astype(str), df['Clean Content'], df['Embedding']):
             if m and isinstance(e, np.ndarray):
-                bucket[cache_key(u, t)] = e
-        emb_buckets[settings_label] = bucket  # most recent last
-        while len(emb_buckets) > EMB_CACHE_SETTINGS:
-            emb_buckets.pop(next(iter(emb_buckets)))
+                emb_cache[cache_key(u, t)] = e
+        while len(emb_cache) > 2 * len(df):  # oldest first
+            emb_cache.pop(next(iter(emb_cache)))
         run['new_embeddings'] = emb['new_count']
         if emb.get('trimmed'):
             trimmed = emb['trimmed']

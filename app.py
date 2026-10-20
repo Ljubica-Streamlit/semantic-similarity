@@ -22,12 +22,14 @@ from utils.export import (
 )
 from utils.columns import load_table, detect_columns, column_labels, build_dataframe
 
-st.set_page_config(page_title="Semantic Similarity Analyzer", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Semantic Similarity Analyzer: Content Cannibalization Audit", page_icon="🔍",
+                   layout="wide")
 
 st.title("🔍 Semantic Similarity Analyzer")
 st.markdown("""
 Measure how semantically similar your pages are using AI embeddings.
-Find duplicate, near-duplicate and overlapping content across your site.
+Find duplicate, near-duplicate and overlapping content across your site. Combine it with your keyword
+cannibalization audit to decide which pages to merge, redirect or keep.
 """)
 
 
